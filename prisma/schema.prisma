@@ -22,7 +22,7 @@ model Conversation {
 model Doctor {
   id           String         @id @default(cuid())
   name         String
-  specialty    String         // Cardiology | Dermatology | Orthopedics | Neurology
+  specialty    String         // Cardiology | Dermatology | Dentistry | Orthopedics | Neurology
   availability Availability[]
   appointments Appointment[]
 

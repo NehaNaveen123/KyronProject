@@ -1,5 +1,5 @@
 /**
- * Seed script — creates 4 doctors and generates availability slots.
+ * Seed script — creates 5 doctors and generates availability slots.
  *
  * Slot rules (spec):
  *   - Weekdays only (Mon–Fri)
@@ -21,6 +21,7 @@ export const VALID_SLOT_HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17] as const;
 const DOCTORS = [
   { name: 'Dr. Sarah Chen',     specialty: 'Cardiology'   },
   { name: 'Dr. Michael Torres', specialty: 'Dermatology'  },
+  { name: 'Dr. Priya Patel',    specialty: 'Dentistry'    },
   { name: 'Dr. Emily Johnson',  specialty: 'Orthopedics'  },
   { name: 'Dr. David Kim',      specialty: 'Neurology'    },
 ];

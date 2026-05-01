@@ -26,6 +26,7 @@ import {
   mapToSpecialty,
   detectTimeframe,
   isOpenTimeframe,
+  isAvailabilityRequest,
   extractEmail,
   extractPhone,
   extractDob,
@@ -51,8 +52,10 @@ interface StoredMessage { role: 'user' | 'assistant'; content: string; }
 
 function hasAvailabilityIntent(text: string): boolean {
   const lower = text.toLowerCase();
-  return ['when', 'today', 'tomorrow', 'available', 'come in',
-          'appointment', 'schedule', 'times'].some(kw => lower.includes(kw));
+  return isAvailabilityRequest(text) ||
+    detectTimeframe(text) !== null ||
+    ['when', 'available', 'come in', 'appointment', 'schedule', 'times', 'openings', 'slots']
+      .some(kw => lower.includes(kw));
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -151,9 +154,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       state.patient.firstName = name.firstName;
       if (name.lastName) state.patient.lastName = name.lastName;
     }
-    if (specialty && !state.patient.specialty) {
+    if (specialty && state.patient.specialty !== specialty) {
       state.patient.specialty = specialty;
       state.patient.reason    = userText;
+      state.doctorId          = null;
+      state.doctorName        = null;
     }
     if (timeframe)   state.timeframe = timeframe;
     else if (openTf) state.timeframe = null;
@@ -174,7 +179,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // ── 6. Fetch slots (deterministic — AI NOT called) ──────────────────────
     // Triggered when info is complete OR the message asks about availability.
     // Requires specialty to call getAvailability().
-    if ((complete || hasAvailabilityIntent(userText)) && state.patient.specialty) {
+    const userConfirmed = isConfirmation(userText);
+
+    if ((complete || hasAvailabilityIntent(userText) || userConfirmed) && state.patient.specialty) {
       return await fetchAndReturnSlots(res, sessionId, history, state);
     }
 
@@ -386,6 +393,8 @@ async function handleConfirmingBooking(
   if (isConfirmation(userText)) {
     const result = await bookAppointment({
       patientName:  `${state.patient.firstName} ${state.patient.lastName}`,
+      firstName:    state.patient.firstName!,
+      lastName:     state.patient.lastName!,
       patientDob:   state.patient.dob!,
       patientPhone: state.patient.phone!,
       patientEmail: state.patient.email!,
@@ -398,8 +407,13 @@ async function handleConfirmingBooking(
     if (result.success) {
       state.step          = 'booked';
       state.appointmentId = result.appointmentId!;
+      if (result.patientFirstName) state.patient.firstName = result.patientFirstName;
       return sendDirect(res, sessionId, history, state,
-        formatBookedMessage(result.doctorName!, result.formatted!, state.patient.firstName!));
+        formatBookedMessage(
+          result.doctorName!,
+          result.formatted!,
+          result.patientFirstName ?? state.patient.firstName ?? state.patient.lastName ?? 'there',
+        ));
     }
 
     // Slot was taken — re-fetch fresh options
@@ -533,8 +547,12 @@ function formatSlotsMessage(
 }
 
 function formatBookedMessage(doctorName: string, formatted: string, firstName: string): string {
+  const displayName = firstName?.trim() && firstName.toLowerCase() !== 'null'
+    ? firstName.trim()
+    : 'there';
+
   return (
-    `Your appointment has been confirmed, ${firstName}!\n\n` +
+    `Your appointment has been confirmed, ${displayName}!\n\n` +
     `  Doctor: ${doctorName}\n` +
     `  Time:   ${formatted}\n\n` +
     `You'll receive a reminder before your visit. ` +
@@ -562,6 +580,8 @@ function buildExistingAppt(row: any): ExistingAppointment {
     specialty:    row.doctor.specialty,
     formatted:    `${day} (${mm}/${dd}) at ${h}:00 ${ampm}`,
     datetime:     row.datetime.toISOString(),
+    firstName:    row.firstName || row.patientName?.split(' ')[0] || '',
+    lastName:     row.lastName || row.patientName?.split(' ').slice(1).join(' ') || '',
     patientName:  row.patientName,
     patientDob:   row.patientDob,
     patientPhone: row.patientPhone,
@@ -571,7 +591,7 @@ function buildExistingAppt(row: any): ExistingAppointment {
 }
 
 function returningPatientMsg(appt: ExistingAppointment): string {
-  const firstName = appt.patientName.split(' ')[0];
+  const firstName = appt.firstName || appt.patientName.split(' ')[0] || 'there';
   return (
     `Welcome back, ${firstName}! I found your existing appointment:\n\n` +
     `  Doctor: ${appt.doctorName} (${appt.specialty})\n` +
@@ -609,14 +629,18 @@ function buildCollectingContext(p: ConversationState['patient'], doctorName: str
     `  - Do NOT mention any appointment times, dates, or availability — not even to say you will check them.\n` +
     `  - Do NOT say "I'll look into that", "let me check", or any phrase that implies looking up times.\n` +
     `  - ONLY ask for the missing fields listed above. Nothing else.`,
+    `  - NEVER list dates, times, or slots. The system handles this automatically.\n` +
+    `  - If the user is ready to book, simply say "Great, let me pull up the available times for you."\n` +
+    `  - DO NOT try to guess when the doctor is free.`,
   ].join('');
 }
 
 function buildConfirmContext(state: ConversationState): string {
   const p = state.patient;
+  const patientName = [p.firstName, p.lastName].filter(Boolean).join(' ') || 'the patient';
   return `Patient selected a slot. Ask them to confirm these exact details:
 
-  Patient:     ${p.firstName} ${p.lastName}
+  Patient:     ${patientName}
   DOB:         ${p.dob}
   Phone:       ${p.phone}
   Email:       ${p.email}

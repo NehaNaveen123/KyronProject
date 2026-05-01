@@ -3,8 +3,8 @@
  *
  * Flow:
  *  1. User clicks "Continue via phone"
- *  2. We call /api/voice-handoff (server creates Vapi web call)
- *  3. We use the @vapi-ai/web SDK to start the call in-browser
+ *  2. We call /api/voice-handoff (server returns context-aware assistant config)
+ *  3. We use the @vapi-ai/web SDK to create/start the call in-browser
  *  4. An overlay shows call state (connecting / in-call / ended)
  */
 'use client';
@@ -16,6 +16,11 @@ interface Props {
 }
 
 type CallState = 'idle' | 'loading' | 'active' | 'ended' | 'error';
+
+type VoiceHandoffResponse = {
+  assistantConfig?: Record<string, unknown>;
+  error?: string;
+};
 
 export default function VoiceHandoffButton({ sessionId }: Props) {
   const [state, setState]     = useState<CallState>('idle');
@@ -34,7 +39,7 @@ export default function VoiceHandoffButton({ sessionId }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ sessionId, mode: 'web' }),
       });
-      const data = await res.json();
+      const data = await res.json() as VoiceHandoffResponse;
 
       if (!res.ok) {
         setError(data.error ?? 'Failed to start voice call');
@@ -42,10 +47,24 @@ export default function VoiceHandoffButton({ sessionId }: Props) {
         return;
       }
 
+      if (!data.assistantConfig) {
+        setError('Voice service did not return an assistant configuration.');
+        setState('error');
+        return;
+      }
+
+      const publicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
+      if (!publicKey) {
+        setError('Voice service is not configured (NEXT_PUBLIC_VAPI_PUBLIC_KEY missing).');
+        setState('error');
+        return;
+      }
+
       // 2. Dynamically import Vapi SDK (avoids SSR issues)
       const { default: Vapi } = await import('@vapi-ai/web');
-      const vapi = new Vapi(process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY ?? '');
+      const vapi = new Vapi(publicKey);
 
+      vapi.on('call-start', () => setState('active'));
       vapi.on('call-end',   () => setState('ended'));
       vapi.on('error',      (e: unknown) => {
         console.error('Vapi error', e);
@@ -53,8 +72,8 @@ export default function VoiceHandoffButton({ sessionId }: Props) {
         setState('error');
       });
 
-      // 3. Start the call using the call ID returned by the server
-      await vapi.start(data.callId);
+      // 3. Start the call with an inline assistant config, per Vapi Web SDK docs.
+      await vapi.start(data.assistantConfig as never);
       setVapiInstance(vapi);
       setState('active');
     } catch (err) {

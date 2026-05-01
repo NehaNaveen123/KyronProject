@@ -10,9 +10,10 @@ const VAPI_API_KEY = process.env.VAPI_API_KEY!;
 const VAPI_BASE    = 'https://api.vapi.ai';
 
 export interface VoiceHandoffResult {
-  callId?:  string;
-  webUrl?:  string;  // for in-browser calls
-  error?:   string;
+  callId?:          string;
+  webUrl?:          string;  // for in-browser calls
+  assistantConfig?: Record<string, unknown>;
+  error?:           string;
 }
 
 /**
@@ -41,47 +42,33 @@ Continue exactly where the text conversation left off. Do not re-introduce yours
 Greet the patient by referencing where you left off in the conversation.`;
 }
 
-/**
- * Creates a Vapi web call (browser-based, no phone number required).
- * Returns a token the frontend Vapi SDK uses to start the call.
- */
-export async function createVapiWebCall(conversationHistory: Array<{ role: string; content: string }>) {
-  const systemPrompt = buildVoiceSystemPrompt(conversationHistory);
-
-  const response = await fetch(`${VAPI_BASE}/call/web`, {
-    method:  'POST',
-    headers: {
-      'Authorization': `Bearer ${VAPI_API_KEY}`,
-      'Content-Type':  'application/json',
+function buildAssistantConfig(systemPrompt: string) {
+  return {
+    name: 'Kyron Medical Scheduler',
+    firstMessage: "Hi, I'm picking up from your text chat. How can I help you continue scheduling your appointment?",
+    model: {
+      provider: 'groq',
+      model:    'llama-3.3-70b-versatile',
+      messages: [{ role: 'system', content: systemPrompt }],
     },
-    body: JSON.stringify({
-      assistant: {
-        name:         'Kyron Medical Scheduler',
-        firstMessage: "Hi, I'm picking up from your text chat. How can I help you continue scheduling your appointment?",
-        model: {
-          provider: 'groq',
-          model:    'llama-3.3-70b-versatile',
-          messages: [{ role: 'system', content: systemPrompt }],
-        },
-        voice: {
-          provider: '11labs',
-          voiceId:  'EXAVITQu4vr4xnSDxMaL', // Sarah — warm, professional
-        },
-        silenceTimeoutSeconds:  30,
-        maxDurationSeconds:     1800,
-        backgroundSound:        'off',
-        backchannelingEnabled:  false,
-      },
-    }),
-  });
+    voice: {
+      provider: '11labs',
+      voiceId:  'EXAVITQu4vr4xnSDxMaL', // Sarah — warm, professional
+    },
+    silenceTimeoutSeconds:  30,
+    maxDurationSeconds:     1800,
+    backgroundSound:        'off',
+    backchannelingEnabled:  false,
+  };
+}
 
-  if (!response.ok) {
-    const text = await response.text();
-    return { error: `Vapi error: ${response.status} ${text}` };
-  }
-
-  const data = await response.json();
-  return { callId: data.id, webUrl: data.webCallUrl };
+/**
+ * Builds an inline assistant config for the browser Vapi SDK.
+ * The SDK creates the web call with the public key when vapi.start(config) runs.
+ */
+export function createVapiWebCall(conversationHistory: Array<{ role: string; content: string }>): VoiceHandoffResult {
+  const systemPrompt = buildVoiceSystemPrompt(conversationHistory);
+  return { assistantConfig: buildAssistantConfig(systemPrompt) };
 }
 
 /**
@@ -104,19 +91,8 @@ export async function createVapiPhoneCall(
       phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID, // set in dashboard
       customer:      { number: patientPhone },
       assistant: {
-        name:         'Kyron Medical Scheduler',
+        ...buildAssistantConfig(systemPrompt),
         firstMessage: "Hello, this is the Kyron Medical scheduling assistant calling to continue helping you book an appointment. Is this a good time?",
-        model: {
-          provider: 'groq',
-          model:    'llama-3.3-70b-versatile',
-          messages: [{ role: 'system', content: systemPrompt }],
-        },
-        voice: {
-          provider: '11labs',
-          voiceId:  'EXAVITQu4vr4xnSDxMaL',
-        },
-        silenceTimeoutSeconds: 30,
-        maxDurationSeconds:    1800,
       },
     }),
   });

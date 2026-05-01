@@ -6,6 +6,8 @@
 import { addDays, addWeeks, startOfWeek, getDay, startOfDay, endOfDay } from 'date-fns';
 import { toZonedTime, fromZonedTime } from 'date-fns-tz';
 
+const TZ = 'America/New_York';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface PatientInfo {
@@ -95,6 +97,7 @@ export function emptyState(): ConversationState {
 export const ALLOWED_SPECIALTIES = [
   'Cardiology',
   'Dermatology',
+  'Dentistry',
   'Orthopedics',
   'Neurology',
 ] as const;
@@ -114,6 +117,12 @@ const SPECIALTY_MAP: Record<AllowedSpecialty, string[]> = {
     'psoriasis', 'hives', 'itching', 'itchy', 'dermatology', 'wart',
     'sunburn', 'dandruff', 'ringworm', 'seborrhea',
   ],
+  Dentistry: [
+    'tooth', 'teeth', 'dental', 'dentist', 'dentistry', 'gum', 'gums',
+    'mouth pain', 'toothache', 'tooth ache', 'broken tooth', 'broke a tooth',
+    'cracked tooth', 'chipped tooth', 'cavity', 'cavities', 'filling',
+    'root canal', 'wisdom tooth', 'wisdom teeth', 'jaw pain', 'bleeding gums',
+  ],
   Orthopedics: [
     'bone', 'joint', 'knee', 'hip', 'back pain', 'back', 'shoulder',
     'fracture', 'arthritis', 'muscle', 'spine', 'orthopedic', 'sports injury',
@@ -129,11 +138,15 @@ const SPECIALTY_MAP: Record<AllowedSpecialty, string[]> = {
 };
 
 /**
- * Maps a message to one of the 4 allowed specialties, or null.
+ * Maps a message to one of the allowed specialties, or null.
  * This is the ONLY function that decides specialty — never the LLM.
  */
 export function mapToSpecialty(text: string): AllowedSpecialty | null {
   const lower = text.toLowerCase();
+  // Dental words can overlap with general injury language ("broke", "pain").
+  // Give them explicit priority so "broke a tooth" never falls into Orthopedics.
+  if (SPECIALTY_MAP.Dentistry.some(kw => lower.includes(kw))) return 'Dentistry';
+
   for (const specialty of ALLOWED_SPECIALTIES) {
     if (SPECIALTY_MAP[specialty].some(kw => lower.includes(kw))) return specialty;
   }
@@ -168,6 +181,24 @@ function toRange(from: Date, to: Date, label: string): TimeframeFilter {
   return { label, from: from.toISOString(), to: to.toISOString() };
 }
 
+function nowInET(): Date {
+  return toZonedTime(new Date(), TZ);
+}
+
+function etDayRange(dayInET: Date, label: string): TimeframeFilter {
+  const etToday = startOf(nowInET()).getTime();
+  const etTarget = startOf(dayInET).getTime();
+  const from = etTarget === etToday
+    ? new Date()
+    : fromZonedTime(startOfDay(dayInET), TZ);
+
+  return toRange(
+    from,
+    fromZonedTime(endOfDay(dayInET), TZ),
+    label,
+  );
+}
+
 /**
  * Returns a copy of d with time set to 00:00:00.000 in SERVER LOCAL TIME.
  * Using setHours (not date-fns startOfDay) avoids UTC-interpretation issues.
@@ -178,21 +209,20 @@ function startOf(d: Date): Date {
   return r;
 }
 
-/**
- * Returns a copy of d with time set to 23:59:59.999 in SERVER LOCAL TIME.
- */
-function endOf(d: Date): Date {
-  const r = new Date(d);
-  r.setHours(23, 59, 59, 999);
-  return r;
-}
-
 /** Returns next occurrence of a weekday (0=Sun … 6=Sat), always in the future. */
 function nextWeekday(targetDow: number): Date {
-  const today    = startOf(new Date());
+  const today    = startOf(nowInET());
   const todayDow = getDay(today);
   let daysAhead  = targetDow - todayDow;
   if (daysAhead <= 0) daysAhead += 7;
+  return addDays(today, daysAhead);
+}
+
+function thisOrNextWeekday(targetDow: number): Date {
+  const today    = startOf(nowInET());
+  const todayDow = getDay(today);
+  let daysAhead  = targetDow - todayDow;
+  if (daysAhead < 0) daysAhead += 7;
   return addDays(today, daysAhead);
 }
 
@@ -204,41 +234,42 @@ function nextWeekday(targetDow: number): Date {
 export function detectTimeframe(text: string): TimeframeFilter | null {
   const lower = text.toLowerCase().trim();
   const now   = new Date();
-  const today = startOf(now);   // midnight today in server local time
+  const etNow = nowInET();
+  const today = startOf(etNow);   // midnight today in America/New_York
 
   if (lower.includes('today')) {
-    // Compute start/end of today in America/New_York regardless of server timezone.
-    // toZonedTime → virtual Date with ET local field values.
-    // startOfDay/endOfDay (date-fns) operate on those ET-local fields.
-    // fromZonedTime converts back to the actual UTC timestamp for Prisma queries.
-    const TZ      = 'America/New_York';
-    const nowInET = toZonedTime(now, TZ);
-    const startET = fromZonedTime(startOfDay(nowInET), TZ);
-    const endET   = fromZonedTime(endOfDay(nowInET),   TZ);
-    return { label: 'today', from: startET.toISOString(), to: endET.toISOString() };
+    return etDayRange(today, 'today');
   }
 
   if (lower.includes('tomorrow')) {
     const tom = addDays(today, 1);
-    return toRange(tom, endOf(tom), 'tomorrow');
+    return etDayRange(tom, 'tomorrow');
   }
 
   if (lower.includes('next week')) {
-    const nextMon = startOfWeek(addWeeks(now, 1), { weekStartsOn: 1 });
-    return toRange(startOf(nextMon), endOf(addDays(nextMon, 4)), 'next week');
+    const nextMon = startOfWeek(addWeeks(etNow, 1), { weekStartsOn: 1 });
+    return toRange(
+      fromZonedTime(startOfDay(nextMon), TZ),
+      fromZonedTime(endOfDay(addDays(nextMon, 4)), TZ),
+      'next week',
+    );
   }
 
   if (lower.includes('this week') || lower.includes('week')) {
-    const thisMon = startOfWeek(now, { weekStartsOn: 1 });
+    const thisMon = startOfWeek(etNow, { weekStartsOn: 1 });
     const thisFri = addDays(thisMon, 4);
     // Weekend: "this week" has no remaining weekdays → show next week instead.
-    const dow = getDay(now);   // 0=Sun, 6=Sat
+    const dow = getDay(etNow);   // 0=Sun, 6=Sat
     if (dow === 0 || dow === 6) {
-      const nextMon = startOfWeek(addWeeks(now, 1), { weekStartsOn: 1 });
-      return toRange(startOf(nextMon), endOf(addDays(nextMon, 4)), 'next week');
+      const nextMon = startOfWeek(addWeeks(etNow, 1), { weekStartsOn: 1 });
+      return toRange(
+        fromZonedTime(startOfDay(nextMon), TZ),
+        fromZonedTime(endOfDay(addDays(nextMon, 4)), TZ),
+        'next week',
+      );
     }
     // Midweek: start from now so already-past morning slots are excluded.
-    return toRange(now, endOf(thisFri), 'this week');
+    return toRange(now, fromZonedTime(endOfDay(thisFri), TZ), 'this week');
   }
 
   // Day names — find next occurrence (all 7 days including weekend)
@@ -248,8 +279,9 @@ export function detectTimeframe(text: string): TimeframeFilter | null {
   ];
   for (const [name, dow] of DAYS) {
     if (lower.includes(name)) {
-      const target = nextWeekday(dow);
-      return toRange(target, endOf(target), name.charAt(0).toUpperCase() + name.slice(1));
+      const wantsNext = new RegExp(`\\bnext\\s+${name}\\b`).test(lower);
+      const target = wantsNext ? nextWeekday(dow) : thisOrNextWeekday(dow);
+      return etDayRange(target, name.charAt(0).toUpperCase() + name.slice(1));
     }
   }
 
@@ -257,8 +289,8 @@ export function detectTimeframe(text: string): TimeframeFilter | null {
   // it's part of a full date like MM/DD/YYYY (e.g., a patient DOB "10/1/2005").
   const mmdd = lower.match(/\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])(?![\d\/])/);
   if (mmdd) {
-    const target = new Date(now.getFullYear(), parseInt(mmdd[1]) - 1, parseInt(mmdd[2]));
-    return toRange(startOf(target), endOf(target), mmdd[0]);
+    const target = new Date(etNow.getFullYear(), parseInt(mmdd[1]) - 1, parseInt(mmdd[2]));
+    return etDayRange(target, mmdd[0]);
   }
 
   // "Month Day" e.g. "May 5", "May 5th"
@@ -272,8 +304,8 @@ export function detectTimeframe(text: string): TimeframeFilter | null {
     if (lower.includes(name)) {
       const dayM = lower.match(new RegExp(`${name}\\s+(\\d{1,2})`));
       if (dayM) {
-        const target = new Date(now.getFullYear(), month - 1, parseInt(dayM[1]));
-        return toRange(startOf(target), endOf(target), `${name} ${dayM[1]}`);
+        const target = new Date(etNow.getFullYear(), month - 1, parseInt(dayM[1]));
+        return etDayRange(target, `${name} ${dayM[1]}`);
       }
     }
   }
@@ -297,13 +329,21 @@ export function isOpenTimeframe(text: string): boolean {
 export function isAvailabilityRequest(text: string): boolean {
   const lower = text.toLowerCase();
   return [
+    'do you have appointments',
+    'do you have appointment',
     'when can i come in',
     'do you have anything today',
+    'do you have anything tomorrow',
     'do you have anything',
     'any opening',
     'any openings',
+    'appointments today',
+    'appointments tomorrow',
     'available appointments',
     'what times are available',
+    'what time is available',
+    'what times do you have',
+    'what time do you have',
     'when is the next available',
     'next available',
     'show me availability',

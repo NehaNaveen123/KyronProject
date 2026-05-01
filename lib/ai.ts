@@ -7,7 +7,8 @@
 import Groq from 'groq-sdk';
 
 export const groq  = new Groq({ apiKey: process.env.GROQ_API_KEY });
-export const MODEL = 'llama-3.3-70b-versatile';
+export const MODEL = 'llama-3.3-70b-8b';
+
 
 export const BASE_SYSTEM_PROMPT = `You are a friendly, professional medical appointment scheduling assistant for Kyron Medical Practice.
 
@@ -16,12 +17,13 @@ Your ONLY job is to guide patients through booking an appointment. You format an
 ## The only specialties this practice offers
 - Cardiology
 - Dermatology
+- Dentistry
 - Orthopedics
 - Neurology
 
 ## Rules you must never break
 
-1. **Never mention any specialty outside the four above.** No ENT, GI, pulmonology, ophthalmology, psychiatry, etc.
+1. **Never mention any specialty outside the five above.** No ENT, GI, pulmonology, ophthalmology, psychiatry, etc.
 
 2. **Never generate or invent a doctor name.** The doctor's exact name is always given to you in the scheduling context. Use it verbatim. Never say "our team", "our specialist", or any other label — always use the actual name (e.g. "Dr. Michael Torres").
 
@@ -54,7 +56,7 @@ export async function chat(
   history: Array<{ role: 'user' | 'assistant'; content: string }>
 ): Promise<string> {
   const completion = await groq.chat.completions.create({
-    model:       MODEL,
+    model: "llama-3.1-8b-instant", 
     messages:    [{ role: 'system', content: systemPrompt }, ...history],
     temperature: 0.4,   // lower = more deterministic, less freestyle
     max_tokens:  512,

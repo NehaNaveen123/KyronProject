@@ -1,6 +1,7 @@
 import { prisma } from './db';
 import { addDays, startOfDay, endOfDay } from 'date-fns';
 import { toZonedTime, fromZonedTime } from 'date-fns-tz';
+import { sendConfirmationEmail } from './mail'; // Create this file as shown in the previous step
 
 const TZ = 'America/New_York';
 
@@ -144,7 +145,7 @@ export async function bookAppointment(params: any) {
   const dt = new Date(params.datetime);
 
   if (!isValid(dt)) {
-    return { success: false, error: 'Invalid slot' };
+    return { success: false as const, error: 'Invalid slot' };
   }
 
   const slot = await prisma.availability.findFirst({
@@ -157,7 +158,7 @@ export async function bookAppointment(params: any) {
   });
 
   if (!slot) {
-    return { success: false, error: 'Slot taken' };
+    return { success: false as const, error: 'Slot taken' };
   }
 
   // Sanitize the combined name: drop any literal 'null' parts that appear
@@ -171,8 +172,11 @@ export async function bookAppointment(params: any) {
   // Prefer explicit firstName/lastName params (new callers pass them separately).
   // Fall back to splitting cleanedName for backward compat.
   const nameParts   = cleanedName.split(' ');
-  const firstName   = ((params.firstName as string | undefined)?.trim()) || nameParts[0] || '';
-  const lastName    = ((params.lastName  as string | undefined)?.trim()) || nameParts.slice(1).join(' ') || '';
+  const firstName   = (((params.firstName as string | undefined)?.trim()) || nameParts[0] || '')
+    .replace(/^null$/i, '');
+  const lastName    = (((params.lastName  as string | undefined)?.trim()) || nameParts.slice(1).join(' ') || '')
+    .replace(/^null$/i, '');
+  const displayFirstName = firstName || cleanedName.split(' ')[0] || 'there';
 
   console.log('[bookAppointment] writing name fields:', JSON.stringify({ firstName, lastName, patientName: cleanedName }));
 
@@ -188,12 +192,24 @@ export async function bookAppointment(params: any) {
 
   const f = format(dt);
 
+  const recipientEmail = params.patientEmail || params.email;
+  if (recipientEmail) {
+    console.log(`[bookAppointment] Triggering confirmation email to: ${recipientEmail}`);
+    
+    // We don't await this so the UI response stays fast
+    sendConfirmationEmail(recipientEmail, {
+      patientName: displayFirstName,
+      doctorName: slot.doctor.name,
+      time: f.formatted // Uses your existing format helper result
+    }).catch(err => console.error("Email background task failed:", err));
+  }
+
   return {
-    success: true,
+    success: true as const,
     appointmentId:    appt.id,
     doctorName:       slot.doctor.name,
     specialty:        slot.doctor.specialty,
-    patientFirstName: firstName,
+    patientFirstName: displayFirstName,
     ...f,
   };
 }
