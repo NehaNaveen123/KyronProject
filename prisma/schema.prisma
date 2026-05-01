@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Persists each chat session's full message history
+model Conversation {
+  id          String   @id @default(cuid())
+  sessionId   String   @unique
+  messages    Json     @default("[]")
+  patientInfo Json?    // Cached collected info for quick resume
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([sessionId])
+}
+
+model Doctor {
+  id           String         @id @default(cuid())
+  name         String
+  specialty    String         // Cardiology | Dermatology | Orthopedics | Neurology
+  availability Availability[]
+  appointments Appointment[]
+
+  @@index([specialty])
+}
+
+// Each row = one bookable time slot for a doctor
+model Availability {
+  id        String   @id @default(cuid())
+  doctorId  String
+  doctor    Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  datetime  DateTime
+  isBooked  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([doctorId, datetime])
+  @@index([doctorId, isBooked, datetime])
+}
+
+model Appointment {
+  id           String   @id @default(cuid())
+  doctorId     String
+  doctor       Doctor   @relation(fields: [doctorId], references: [id])
+  firstName    String   @default("")   // stored separately so lookups never depend on string splitting
+  lastName     String   @default("")
+  patientName  String                  // kept for backward-compat; equals firstName + " " + lastName
+  patientDob   String
+  patientPhone String
+  patientEmail String
+  reason       String
+  datetime     DateTime
+  sessionId    String   // Links back to the conversation
+  createdAt    DateTime @default(now())
+
+  @@index([sessionId])
+}
