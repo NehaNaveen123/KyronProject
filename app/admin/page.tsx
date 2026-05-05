@@ -8,10 +8,13 @@ interface Slot {
   isBooked: boolean;
 }
 
-interface Doctor {
+interface Provider {
   id:           string;
   name:         string;
-  specialty:    string;
+  specialty:    string;   // joined display string
+  specialties:  string[];
+  credentials:  string;
+  organization: { name: string; slug: string };
   availability: Slot[];
 }
 
@@ -32,16 +35,16 @@ function formatDt(iso: string) {
   });
 }
 
-// ── Doctors tab ───────────────────────────────────────────────────────────────
+// ── Providers (doctors) tab ───────────────────────────────────────────────────
 
-function DoctorsTab() {
-  const [doctors, setDoctors]         = useState<Doctor[]>([]);
-  const [loading, setLoading]         = useState(true);
-  const [selected, setSelected]       = useState<string>('');
+function ProvidersTab() {
+  const [providers,   setProviders]   = useState<Provider[]>([]);
+  const [loading,     setLoading]     = useState(true);
+  const [selected,    setSelected]    = useState<string>('');
   const [newSlotDate, setNewSlotDate] = useState('');
   const [newSlotTime, setNewSlotTime] = useState('09:00');
-  const [saving, setSaving]           = useState(false);
-  const [feedback, setFeedback]       = useState('');
+  const [saving,      setSaving]      = useState(false);
+  const [feedback,    setFeedback]    = useState('');
 
   function flash(msg: string) {
     setFeedback(msg);
@@ -50,16 +53,16 @@ function DoctorsTab() {
 
   async function load() {
     setLoading(true);
-    const res = await fetch('/api/admin/doctors');
+    const res  = await fetch('/api/admin/doctors');
     const data = await res.json();
-    setDoctors(data.doctors);
-    if (!selected && data.doctors.length) setSelected(data.doctors[0].id);
+    setProviders(data.doctors ?? []);
+    if (!selected && data.doctors?.length) setSelected(data.doctors[0].id);
     setLoading(false);
   }
 
   useEffect(() => { load(); }, []);
 
-  const doctor = doctors.find(d => d.id === selected);
+  const provider = providers.find(p => p.id === selected);
 
   async function addSlot() {
     if (!newSlotDate || !selected) return;
@@ -68,7 +71,7 @@ function DoctorsTab() {
     const res = await fetch('/api/admin/availability', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ doctorId: selected, datetime }),
+      body:    JSON.stringify({ providerId: selected, datetime }),
     });
     const data = await res.json();
     if (res.ok) { flash('Slot added!'); load(); }
@@ -115,33 +118,34 @@ function DoctorsTab() {
         </div>
       )}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-4">
-        {/* Doctor selector sidebar */}
+        {/* Provider selector sidebar */}
         <div className="space-y-2">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Doctors</h2>
-          {doctors.map(d => (
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Providers</h2>
+          {providers.map(p => (
             <button
-              key={d.id}
-              onClick={() => setSelected(d.id)}
+              key={p.id}
+              onClick={() => setSelected(p.id)}
               className={`w-full rounded-xl border px-4 py-3 text-left transition ${
-                selected === d.id
+                selected === p.id
                   ? 'border-blue-500 bg-blue-50 text-blue-900'
                   : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
               }`}
             >
-              <div className="font-medium text-sm">{d.name}</div>
-              <div className="text-xs text-slate-500">{d.specialty}</div>
+              <div className="font-medium text-sm">{p.name}</div>
+              <div className="text-xs text-slate-500">{p.specialty}</div>
+              <div className="text-xs text-slate-400 mt-0.5">{p.organization.name}</div>
               <div className="mt-1 text-xs text-slate-400">
-                {d.availability.filter(s => !s.isBooked && new Date(s.datetime) > new Date()).length} open slots
+                {p.availability.filter(s => !s.isBooked && new Date(s.datetime) > new Date()).length} open slots
               </div>
             </button>
           ))}
         </div>
 
         {/* Availability panel */}
-        {doctor && (
+        {provider && (
           <div className="lg:col-span-3 space-y-6">
             <div className="rounded-xl border border-slate-200 bg-white p-5">
-              <h2 className="mb-4 text-sm font-semibold text-slate-800">Add availability slot for {doctor.name}</h2>
+              <h2 className="mb-4 text-sm font-semibold text-slate-800">Add availability slot for {provider.name}</h2>
               <div className="flex flex-wrap gap-3">
                 <input
                   type="date"
@@ -172,11 +176,11 @@ function DoctorsTab() {
             <div className="rounded-xl border border-slate-200 bg-white">
               <div className="border-b border-slate-100 px-5 py-4">
                 <h2 className="text-sm font-semibold text-slate-800">
-                  Upcoming slots — {doctor.name}
+                  Upcoming slots — {provider.name}
                 </h2>
               </div>
               <div className="divide-y divide-slate-50">
-                {doctor.availability
+                {provider.availability
                   .filter(s => new Date(s.datetime) >= new Date())
                   .sort((a, b) => new Date(a.datetime).getTime() - new Date(b.datetime).getTime())
                   .slice(0, 60)
@@ -208,7 +212,7 @@ function DoctorsTab() {
                       </div>
                     </div>
                   ))}
-                {doctor.availability.filter(s => new Date(s.datetime) >= new Date()).length === 0 && (
+                {provider.availability.filter(s => new Date(s.datetime) >= new Date()).length === 0 && (
                   <p className="px-5 py-6 text-sm text-slate-400">No upcoming slots. Add one above.</p>
                 )}
               </div>
@@ -224,7 +228,7 @@ function DoctorsTab() {
 
 function PatientsTab() {
   const [patients, setPatients] = useState<Patient[]>([]);
-  const [loading, setLoading]   = useState(true);
+  const [loading,  setLoading]  = useState(true);
   const [feedback, setFeedback] = useState('');
 
   function flash(msg: string) {
@@ -234,7 +238,7 @@ function PatientsTab() {
 
   async function load() {
     setLoading(true);
-    const res = await fetch('/api/patients');
+    const res  = await fetch('/api/patients');
     const data = await res.json();
     setPatients(data.patients ?? []);
     setLoading(false);
@@ -244,7 +248,7 @@ function PatientsTab() {
 
   async function deletePatient(id: string, name: string) {
     if (!confirm(`Delete patient record for ${name}? This will also free their appointment slot.`)) return;
-    const res = await fetch(`/api/patients/${id}`, { method: 'DELETE' });
+    const res  = await fetch(`/api/patients/${id}`, { method: 'DELETE' });
     const data = await res.json();
     if (res.ok) { flash('Patient deleted and slot freed.'); load(); }
     else flash(`Error: ${data.error}`);
@@ -316,10 +320,10 @@ function PatientsTab() {
 
 // ── Page shell ────────────────────────────────────────────────────────────────
 
-type Tab = 'doctors' | 'patients';
+type Tab = 'providers' | 'patients';
 
 export default function AdminPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('doctors');
+  const [activeTab, setActiveTab] = useState<Tab>('providers');
 
   return (
     <div className="min-h-screen bg-slate-50 p-6">
@@ -327,17 +331,24 @@ export default function AdminPage() {
         {/* Header */}
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">Admin Dashboard</h1>
-            <p className="text-sm text-slate-500">Manage doctor availability — changes take effect immediately</p>
+            <h1 className="text-2xl font-bold text-slate-900">Kyron Admin</h1>
+            <p className="text-sm text-slate-500">Platform-wide provider availability management</p>
           </div>
-          <a href="/" className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">
-            ← Back to chat
-          </a>
+          <div className="flex items-center gap-2">
+            <a href="/onboarding"
+              className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">
+              + New org
+            </a>
+            <a href="/"
+              className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">
+              ← Back to chat
+            </a>
+          </div>
         </div>
 
         {/* Tab bar */}
         <div className="mb-6 flex gap-1 rounded-xl border border-slate-200 bg-white p-1 w-fit">
-          {(['doctors', 'patients'] as Tab[]).map(tab => (
+          {(['providers', 'patients'] as Tab[]).map(tab => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -352,7 +363,7 @@ export default function AdminPage() {
           ))}
         </div>
 
-        {activeTab === 'doctors' ? <DoctorsTab /> : <PatientsTab />}
+        {activeTab === 'providers' ? <ProvidersTab /> : <PatientsTab />}
       </div>
     </div>
   );

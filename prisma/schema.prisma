@@ -19,44 +19,104 @@ model Conversation {
   @@index([sessionId])
 }
 
-model Doctor {
-  id           String         @id @default(cuid())
-  name         String
-  specialty    String         // Cardiology | Dermatology | Dentistry | Orthopedics | Neurology
-  availability Availability[]
-  appointments Appointment[]
-
-  @@index([specialty])
+// A practice/clinic that self-registers on Kyron
+model Organization {
+  id            String     @id @default(cuid())
+  name          String
+  slug          String     @unique   // URL-safe identifier: "valley-family-medicine"
+  address       String
+  phone         String
+  hours         Json       // { monday: { open: "09:00", close: "17:00", closed: false }, ... }
+  adminEmail      String     @unique
+  adminPassword   String     // bcrypt hash
+  schedulingRules  Json?      @default("[]")   // OrgSchedulingRule[]
+  vogentAgentId    String?    // Vogent agent ID (set after provisioning)
+  vogentPhoneId    String?    // Vogent phone number resource ID
+  vogentPhoneNumber String?   // E.164 phone number e.g. +14155551234
+  vogentCalls      VogentCall[]
+  providers        Provider[]
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
 }
 
-// Each row = one bookable time slot for a doctor
-model Availability {
-  id        String   @id @default(cuid())
-  doctorId  String
-  doctor    Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
-  datetime  DateTime
-  isBooked  Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// A doctor/provider within an organization (replaces the hard-coded Doctor model)
+model Provider {
+  id             String        @id @default(cuid())
+  name           String
+  credentials    String        // e.g., "MD, FACC"
+  specialties     String[]      // e.g., ["Cardiology", "Internal Medicine"]
+  schedulingRules Json?         @default("[]")   // ProviderSchedulingRule[]
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId  String
+  availability   Availability[]
+  appointments   Appointment[]
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
-  @@unique([doctorId, datetime])
-  @@index([doctorId, isBooked, datetime])
+  @@index([organizationId])
+}
+
+// Each row = one bookable time slot for a provider
+model Availability {
+  id         String   @id @default(cuid())
+  providerId String
+  provider   Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  datetime   DateTime
+  isBooked   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([providerId, datetime])
+  @@index([providerId, isBooked, datetime])
 }
 
 model Appointment {
-  id           String   @id @default(cuid())
-  doctorId     String
-  doctor       Doctor   @relation(fields: [doctorId], references: [id])
-  firstName    String   @default("")   // stored separately so lookups never depend on string splitting
-  lastName     String   @default("")
-  patientName  String                  // kept for backward-compat; equals firstName + " " + lastName
-  patientDob   String
-  patientPhone String
-  patientEmail String
-  reason       String
-  datetime     DateTime
-  sessionId    String   // Links back to the conversation
-  createdAt    DateTime @default(now())
+  id            String   @id @default(cuid())
+  providerId    String
+  provider      Provider @relation(fields: [providerId], references: [id])
+  firstName     String   @default("")   // stored separately so lookups never depend on string splitting
+  lastName      String   @default("")
+  patientName   String                  // kept for display; equals firstName + " " + lastName
+  patientDob    String
+  patientPhone  String
+  patientEmail  String
+  reason        String
+  datetime      DateTime
+  sessionId     String   // Links back to the conversation
+  createdAt     DateTime @default(now())
 
   @@index([sessionId])
+}
+
+// Persists every inbound Vogent phone call for a given org
+model VogentCall {
+  id             String       @id @default(cuid())
+  dialId         String       @unique        // Vogent's dial ID
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId String
+  agentId        String?
+  callerPhone    String?                     // caller's number from Vogent event
+  status         String       @default("in_progress")  // in_progress | completed | no_answer
+  durationSeconds Int?
+
+  transcript     String?      @db.Text       // full call transcript
+  summary        String?      @db.Text       // Vogent's post-call summary
+
+  // Patient info collected during the call
+  patientName    String?
+  patientDob     String?
+  patientPhone   String?
+  patientEmail   String?
+  reason         String?
+
+  // Booking outcome (null if no appointment was made)
+  appointmentId  String?
+  bookedAt       DateTime?
+
+  startedAt      DateTime     @default(now())
+  endedAt        DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId, startedAt(sort: Desc)])
 }

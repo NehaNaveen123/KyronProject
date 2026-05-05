@@ -1,7 +1,14 @@
 import { prisma } from './db';
 import { addDays, startOfDay, endOfDay } from 'date-fns';
 import { toZonedTime, fromZonedTime } from 'date-fns-tz';
-import { sendConfirmationEmail } from './mail'; // Create this file as shown in the previous step
+import { sendConfirmationEmail } from './mail';
+import {
+  filterSlotsByRules,
+  checkSlot,
+  buildRuleExplanation,
+  type OrgSchedulingRule,
+  type ProviderSchedulingRule,
+} from './rules';
 
 const TZ = 'America/New_York';
 
@@ -44,29 +51,34 @@ export function isValidSlotTime(dt: Date): boolean {
   return HOURS.includes(etHour) && dt.getMinutes() === 0 && dt.getSeconds() === 0;
 }
 
-// Internal alias kept for backward compat within this file.
 const isValid = isValidSlotTime;
 
 function toSlot(s: any) {
   const f = format(s.datetime);
-
   return {
-    id: s.id,
+    id:       s.id,
     datetime: s.datetime.toISOString(),
     ...f,
   };
 }
 
-export async function getDoctorBySpecialty(specialty: string) {
-  return prisma.doctor.findFirst({
-    where: { specialty },
-    select: { id: true, name: true },
+/**
+ * Look up a provider by specialty string, optionally scoped to an org.
+ */
+export async function getProviderBySpecialty(specialty: string, orgId?: string) {
+  return prisma.provider.findFirst({
+    where: {
+      specialties: { has: specialty },
+      ...(orgId ? { organizationId: orgId } : {}),
+    },
+    select: { id: true, name: true, specialties: true },
   });
 }
 
+/** @deprecated Use getProviderBySpecialty */
+export const getDoctorBySpecialty = getProviderBySpecialty;
+
 function todayET(): { from: Date; to: Date } {
-  // Build today's boundaries in America/New_York using the server clock only —
-  // never derive "today" from parsed conversation text.
   const now     = new Date();
   const nowInET = toZonedTime(now, TZ);
   return {
@@ -90,91 +102,154 @@ function safeSlots(raw: any[]): ReturnType<typeof toSlot>[] {
   return result;
 }
 
-export async function getAvailability(specialty: string, timeframe?: any) {
+// ─── Availability query ───────────────────────────────────────────────────────
+
+interface AvailabilityResult {
+  doctorId:       string;
+  doctorName:     string;
+  specialty:      string;
+  slots:          ReturnType<typeof toSlot>[];
+  blockedReasons: string[];   // why slots were filtered out, for patient-facing messages
+}
+
+/**
+ * Fetches available slots for a specialty, scoped to an org when orgId is provided.
+ * Applies all scheduling rules (org + provider) before returning slots.
+ *
+ * @param isNewPatient  true if the patient has no existing appointment in the system
+ */
+export async function getAvailability(
+  specialty:    string,
+  timeframe?:   any,
+  orgId?:       string,
+  isNewPatient  = true,
+): Promise<AvailabilityResult> {
   const now = new Date();
 
-  // When a specific timeframe is passed (user said "today", "tomorrow", etc.), honour it.
-  // When no timeframe is given, ALWAYS derive the window from the server clock —
-  // never trust dates that may have leaked in from conversation text (e.g. a DOB).
   const hasExplicitTimeframe = !!(timeframe?.from && timeframe?.to);
   const from = hasExplicitTimeframe ? new Date(timeframe.from) : todayET().from;
   const to   = hasExplicitTimeframe ? new Date(timeframe.to)   : todayET().to;
 
-  const queryDoctor = (f: Date, t: Date) =>
-    prisma.doctor.findFirst({
-      where: { specialty },
-      include: {
+  const orgFilter = orgId ? { organizationId: orgId } : {};
+
+  // Fetch provider + availability + rules in one query
+  const queryProvider = (f: Date, t: Date) =>
+    prisma.provider.findFirst({
+      where: { specialties: { has: specialty }, ...orgFilter },
+      select: {
+        id:             true,
+        name:           true,
+        specialties:    true,
+        schedulingRules: true,
+        organization: {
+          select: { schedulingRules: true },
+        },
         availability: {
-          where: { isBooked: false, datetime: { gte: f, lte: t } },
+          where:   { isBooked: false, datetime: { gte: f, lte: t } },
           orderBy: { datetime: 'asc' },
-          take: 20,
+          take:    20,
+          select:  { id: true, datetime: true },
         },
       },
     });
 
-  console.log('[getAvailability] querying', specialty, 'from', from.toISOString(), 'to', to.toISOString(), '| serverNow:', now.toISOString());
+  console.log(
+    '[getAvailability] querying', specialty,
+    'from', from.toISOString(), 'to', to.toISOString(),
+    '| serverNow:', now.toISOString(),
+    '| isNewPatient:', isNewPatient,
+  );
 
-  const doctor = await queryDoctor(from, to);
+  const provider = await queryProvider(from, to);
 
-  if (!doctor) {
-    return { doctorId: '', doctorName: '', specialty, slots: [] };
+  if (!provider) {
+    return { doctorId: '', doctorName: '', specialty, slots: [], blockedReasons: [] };
   }
 
-  let slots = safeSlots(doctor.availability);
+  const orgRules      = ((provider.organization?.schedulingRules ?? []) as unknown) as OrgSchedulingRule[];
+  const providerRules = ((provider.schedulingRules ?? [])            as unknown) as ProviderSchedulingRule[];
+  const ruleOptions   = { isNewPatient, now };
 
-  // When the default (today) window returned nothing, automatically expand to
-  // the next 7 days so the patient always sees upcoming options.
-  if (!hasExplicitTimeframe && slots.length === 0) {
+  let raw    = safeSlots(provider.availability);
+  let result = filterSlotsByRules(raw, orgRules, providerRules, ruleOptions);
+
+  // When the default (today) window returned nothing, auto-expand to the next 7 days
+  if (!hasExplicitTimeframe && result.slots.length === 0) {
     const expand7To = fromZonedTime(endOfDay(toZonedTime(addDays(now, 7), TZ)), TZ);
     console.log('[getAvailability] no slots today — expanding to 7 days, to:', expand7To.toISOString());
-    const doctor7 = await queryDoctor(from, expand7To);
-    if (doctor7) slots = safeSlots(doctor7.availability);
+    const provider7 = await queryProvider(from, expand7To);
+    if (provider7) {
+      raw    = safeSlots(provider7.availability);
+      result = filterSlotsByRules(raw, orgRules, providerRules, ruleOptions);
+    }
   }
 
-  console.log('[getAvailability] slots after filtering:', slots.length);
+  console.log('[getAvailability] slots after rule filtering:', result.slots.length, '| blocked:', result.blockedCount);
 
   return {
-    doctorId:   doctor.id,
-    doctorName: doctor.name,
+    doctorId:       provider.id,
+    doctorName:     provider.name,
     specialty,
-    slots,
+    slots:          result.slots,
+    blockedReasons: result.reasons,
   };
 }
+
+// ─── Booking ──────────────────────────────────────────────────────────────────
 
 export async function bookAppointment(params: any) {
   const dt = new Date(params.datetime);
 
   if (!isValid(dt)) {
-    return { success: false as const, error: 'Invalid slot' };
+    return { success: false as const, error: 'Invalid slot time' };
   }
 
   const slot = await prisma.availability.findFirst({
     where: {
-      doctorId: params.doctorId,
-      datetime: dt,
-      isBooked: false,
+      providerId: params.doctorId,
+      datetime:   dt,
+      isBooked:   false,
     },
-    include: { doctor: true },
+    select: {
+      id:       true,
+      isBooked: true,
+      provider: {
+        select: {
+          name:           true,
+          specialties:    true,
+          schedulingRules: true,
+          organization:   { select: { schedulingRules: true } },
+        },
+      },
+    },
   });
 
   if (!slot) {
-    return { success: false as const, error: 'Slot taken' };
+    return { success: false as const, error: 'Slot taken or not found' };
   }
 
-  // Sanitize the combined name: drop any literal 'null' parts that appear
-  // when session state is incomplete, so the DB never stores "null null".
+  // Last-line-of-defence: re-check rules at write time (prevents races and
+  // bookings of slots that slipped through an old filtered list)
+  const orgRules      = ((slot.provider.organization?.schedulingRules ?? []) as unknown) as OrgSchedulingRule[];
+  const providerRules = ((slot.provider.schedulingRules ?? [])              as unknown) as ProviderSchedulingRule[];
+  const isNewPatient  = params.isNewPatient ?? true;
+
+  const violation = checkSlot(dt, orgRules, providerRules, { isNewPatient, now: new Date() });
+  if (violation) {
+    return { success: false as const, error: `This slot cannot be booked: ${violation}` };
+  }
+
+  // Sanitize name fields
   const cleanedName = (params.patientName as string ?? '')
     .split(' ')
     .filter(part => part && part.toLowerCase() !== 'null')
     .join(' ')
     .trim() || 'Unknown Patient';
 
-  // Prefer explicit firstName/lastName params (new callers pass them separately).
-  // Fall back to splitting cleanedName for backward compat.
-  const nameParts   = cleanedName.split(' ');
-  const firstName   = (((params.firstName as string | undefined)?.trim()) || nameParts[0] || '')
+  const nameParts  = cleanedName.split(' ');
+  const firstName  = (((params.firstName as string | undefined)?.trim()) || nameParts[0] || '')
     .replace(/^null$/i, '');
-  const lastName    = (((params.lastName  as string | undefined)?.trim()) || nameParts.slice(1).join(' ') || '')
+  const lastName   = (((params.lastName  as string | undefined)?.trim()) || nameParts.slice(1).join(' ') || '')
     .replace(/^null$/i, '');
   const displayFirstName = firstName || cleanedName.split(' ')[0] || 'there';
 
@@ -182,11 +257,22 @@ export async function bookAppointment(params: any) {
 
   const [appt] = await prisma.$transaction([
     prisma.appointment.create({
-      data: { ...params, patientName: cleanedName, firstName, lastName },
+      data: {
+        providerId:   params.doctorId,
+        patientName:  cleanedName,
+        firstName,
+        lastName,
+        patientDob:   params.patientDob,
+        patientPhone: params.patientPhone,
+        patientEmail: params.patientEmail,
+        reason:       params.reason,
+        datetime:     dt,
+        sessionId:    params.sessionId,
+      },
     }),
     prisma.availability.update({
       where: { id: slot.id },
-      data: { isBooked: true },
+      data:  { isBooked: true },
     }),
   ]);
 
@@ -195,21 +281,22 @@ export async function bookAppointment(params: any) {
   const recipientEmail = params.patientEmail || params.email;
   if (recipientEmail) {
     console.log(`[bookAppointment] Triggering confirmation email to: ${recipientEmail}`);
-    
-    // We don't await this so the UI response stays fast
     sendConfirmationEmail(recipientEmail, {
       patientName: displayFirstName,
-      doctorName: slot.doctor.name,
-      time: f.formatted // Uses your existing format helper result
-    }).catch(err => console.error("Email background task failed:", err));
+      doctorName:  slot.provider.name,
+      time:        f.formatted,
+    }).catch(err => console.error('Email background task failed:', err));
   }
 
   return {
-    success: true as const,
+    success:          true as const,
     appointmentId:    appt.id,
-    doctorName:       slot.doctor.name,
-    specialty:        slot.doctor.specialty,
+    doctorName:       slot.provider.name,
+    specialty:        slot.provider.specialties[0] ?? '',
     patientFirstName: displayFirstName,
     ...f,
   };
 }
+
+// ─── Rule-violation explanation (re-exported for chat.ts) ─────────────────────
+export { buildRuleExplanation };

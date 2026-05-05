@@ -2,7 +2,7 @@
  * POST /api/chat
  *
  * Control flow (strictly in order on every request):
- *   1. Receive message, load session state
+ *   1. Receive message + optional orgSlug, load session state
  *   2. Dispatch mid-flow states (showing_availability, confirming_booking, booked,
  *      returning_patient, confirming_cancel, rescheduling, confirming_reschedule)
  *   3. Check for returning patient (phone/email in message → DB lookup) → return if found
@@ -19,11 +19,12 @@
 
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { chat, BASE_SYSTEM_PROMPT } from '../../lib/ai';
-import { getAvailability, bookAppointment, getDoctorBySpecialty } from '../../lib/booking';
+import { getAvailability, bookAppointment, getProviderBySpecialty, buildRuleExplanation } from '../../lib/booking';
 import { prisma } from '../../lib/db';
 import {
   emptyState,
   mapToSpecialty,
+  mapToProviderSpecialty,
   detectTimeframe,
   isOpenTimeframe,
   isAvailabilityRequest,
@@ -47,8 +48,6 @@ import {
 interface StoredMessage { role: 'user' | 'assistant'; content: string; }
 
 // ─── Availability intent keywords ─────────────────────────────────────────────
-// These trigger a slot fetch even before all 6 intake fields are complete,
-// provided specialty is already known.
 
 function hasAvailabilityIntent(text: string): boolean {
   const lower = text.toLowerCase();
@@ -63,7 +62,9 @@ function hasAvailabilityIntent(text: string): boolean {
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { sessionId, message } = req.body as { sessionId?: string; message?: string };
+  const { sessionId, message, orgSlug } = req.body as {
+    sessionId?: string; message?: string; orgSlug?: string;
+  };
   if (!sessionId || !message?.trim()) {
     return res.status(400).json({ error: 'sessionId and message are required' });
   }
@@ -80,29 +81,39 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ? (convo.patientInfo as unknown as ConversationState)
       : emptyState();
 
+    // Persist orgSlug into state from the first message
+    if (orgSlug && !state.orgSlug) state.orgSlug = orgSlug;
+
     history.push({ role: 'user', content: userText });
 
-    // ── 2. Mid-flow dispatch ────────────────────────────────────────────────
-    // Once a patient is in the funnel these states handle themselves and return
-    // immediately — they never fall through to the intake path below.
+    // Resolve org if slug is present — we need orgId for scoped DB queries
+    let orgId: string | undefined;
+    if (state.orgSlug) {
+      const org = await prisma.organization.findUnique({
+        where: { slug: state.orgSlug },
+        select: { id: true },
+      });
+      orgId = org?.id;
+    }
 
+    // ── 2. Mid-flow dispatch ────────────────────────────────────────────────
     if (state.step === 'returning_patient') {
-      return await handleReturningPatient(res, sessionId, history, state, userText);
+      return await handleReturningPatient(res, sessionId, history, state, userText, orgId);
     }
     if (state.step === 'confirming_cancel') {
       return await handleConfirmingCancel(res, sessionId, history, state, userText);
     }
     if (state.step === 'rescheduling') {
-      return await handleRescheduling(res, sessionId, history, state, userText);
+      return await handleRescheduling(res, sessionId, history, state, userText, orgId);
     }
     if (state.step === 'confirming_reschedule') {
-      return await handleConfirmingReschedule(res, sessionId, history, state, userText);
+      return await handleConfirmingReschedule(res, sessionId, history, state, userText, orgId);
     }
     if (state.step === 'showing_availability') {
-      return await handleShowingAvailability(res, sessionId, history, state, userText);
+      return await handleShowingAvailability(res, sessionId, history, state, userText, orgId);
     }
     if (state.step === 'confirming_booking') {
-      return await handleConfirmingBooking(res, sessionId, history, state, userText);
+      return await handleConfirmingBooking(res, sessionId, history, state, userText, orgId);
     }
     if (state.step === 'booked') {
       return await respondWithAI(
@@ -113,8 +124,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // ── 3. Returning patient check ──────────────────────────────────────────
-    // Extract phone/email from this message only — never from accumulated state.
-    // Server does the date math; DOB is never used here.
     const emailNow = extractEmail(userText);
     const phoneNow = extractPhone(userText);
 
@@ -125,8 +134,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             ...(emailNow ? [{ patientEmail: emailNow }] : []),
             ...(phoneNow ? [{ patientPhone: phoneNow }] : []),
           ],
+          ...(orgId ? { provider: { organizationId: orgId } } : {}),
         },
-        include: { doctor: { select: { id: true, name: true, specialty: true } } },
+        include: { provider: { select: { id: true, name: true, specialties: true } } },
         orderBy: { createdAt: 'desc' },
       });
 
@@ -143,9 +153,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const phone     = extractPhone(userText);
     const dob       = extractDob(userText);
     const name      = extractName(userText);
-    const specialty = mapToSpecialty(userText);
     const timeframe = detectTimeframe(userText);
     const openTf    = isOpenTimeframe(userText);
+
+    // Specialty detection — dynamic when org has providers, static fallback otherwise
+    let specialty: string | null = null;
+    if (orgId) {
+      // Load this org's provider specialties for dynamic matching
+      const orgProviders = await prisma.provider.findMany({
+        where: { organizationId: orgId },
+        select: { specialties: true },
+      });
+      const allSpecialties = [...new Set(orgProviders.flatMap(p => p.specialties))];
+      specialty = mapToProviderSpecialty(userText, allSpecialties);
+    } else {
+      specialty = mapToSpecialty(userText);
+    }
 
     if (email    && !state.patient.email)     state.patient.email    = email;
     if (phone    && !state.patient.phone)     state.patient.phone    = phone;
@@ -172,24 +195,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       phone:     state.patient.phone,
       email:     state.patient.email,
       specialty: state.patient.specialty,
+      orgSlug:   state.orgSlug ?? null,
       timeframe: state.timeframe?.label ?? null,
       serverNow: new Date().toISOString(),
     });
 
     // ── 6. Fetch slots (deterministic — AI NOT called) ──────────────────────
-    // Triggered when info is complete OR the message asks about availability.
-    // Requires specialty to call getAvailability().
     const userConfirmed = isConfirmation(userText);
 
     if ((complete || hasAvailabilityIntent(userText) || userConfirmed) && state.patient.specialty) {
-      return await fetchAndReturnSlots(res, sessionId, history, state);
+      return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
     }
 
     // ── 7. Info incomplete — AI collects remaining fields ───────────────────
-    // AI is explicitly forbidden from mentioning times, dates, or availability.
     if (!state.doctorName && state.patient.specialty) {
-      const doc = await getDoctorBySpecialty(state.patient.specialty);
-      if (doc) { state.doctorId = doc.id; state.doctorName = doc.name; }
+      const provider = await getProviderBySpecialty(state.patient.specialty, orgId);
+      if (provider) { state.doctorId = provider.id; state.doctorName = provider.name; }
     }
 
     return await respondWithAI(
@@ -206,31 +227,36 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
 // ─── Mid-flow handlers ────────────────────────────────────────────────────────
 
+/** True when the patient has no prior appointment — determines new_patient_days enforcement. */
+function isNewPatient(state: ConversationState): boolean {
+  return !state.existingAppointment;
+}
+
 async function handleReturningPatient(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState, userText: string,
+  state: ConversationState, userText: string, orgId?: string,
 ): Promise<void> {
   const appt = state.existingAppointment!;
 
   if (isKeepIntent(userText)) {
     return sendDirect(res, sessionId, history, state,
-      `Your appointment with ${appt.doctorName} on ${appt.formatted} is all set. ` +
+      `Your appointment with ${appt.providerName} on ${appt.formatted} is all set. ` +
       `Is there anything else I can help you with?`);
   }
 
   if (isRescheduleIntent(userText)) {
     state.step              = 'rescheduling';
     state.patient.specialty = appt.specialty;
-    state.doctorId          = appt.doctorId;
-    state.doctorName        = appt.doctorName;
+    state.doctorId          = appt.providerId;
+    state.doctorName        = appt.providerName;
     state.timeframe         = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   if (isCancelIntent(userText)) {
     state.step = 'confirming_cancel';
     return sendDirect(res, sessionId, history, state,
-      `Are you sure you want to cancel your appointment with ${appt.doctorName} ` +
+      `Are you sure you want to cancel your appointment with ${appt.providerName} ` +
       `on ${appt.formatted}? Reply "yes" to confirm or "no" to keep it.`);
   }
 
@@ -247,14 +273,14 @@ async function handleConfirmingCancel(
     await prisma.$transaction(async (tx) => {
       await tx.appointment.delete({ where: { id: appt.id } });
       await tx.availability.updateMany({
-        where: { doctorId: appt.doctorId, datetime: new Date(appt.datetime) },
+        where: { providerId: appt.providerId, datetime: new Date(appt.datetime) },
         data:  { isBooked: false },
       });
     });
     state.step                = 'collecting_info';
     state.existingAppointment = null;
     return sendDirect(res, sessionId, history, state,
-      `Your appointment with ${appt.doctorName} on ${appt.formatted} has been cancelled. ` +
+      `Your appointment with ${appt.providerName} on ${appt.formatted} has been cancelled. ` +
       `If you'd like to schedule a new appointment, just let me know.`);
   }
 
@@ -264,7 +290,7 @@ async function handleConfirmingCancel(
 
 async function handleRescheduling(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState, userText: string,
+  state: ConversationState, userText: string, orgId?: string,
 ): Promise<void> {
   if (isCancellation(userText)) {
     state.step = 'returning_patient';
@@ -286,9 +312,8 @@ async function handleRescheduling(
       `Reply "yes" to confirm or "no" to see other times.`);
   }
 
-  // New timeframe or no selection yet — re-fetch
   if (timeframe || openTf || state.slots.length === 0) {
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   return sendDirect(res, sessionId, history, state,
@@ -297,7 +322,7 @@ async function handleRescheduling(
 
 async function handleConfirmingReschedule(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState, userText: string,
+  state: ConversationState, userText: string, orgId?: string,
 ): Promise<void> {
   const appt = state.existingAppointment!;
 
@@ -312,7 +337,7 @@ async function handleConfirmingReschedule(
     await prisma.$transaction(async (tx) => {
       await tx.appointment.delete({ where: { id: appt.id } });
       await tx.availability.updateMany({
-        where: { doctorId: appt.doctorId, datetime: new Date(appt.datetime) },
+        where: { providerId: appt.providerId, datetime: new Date(appt.datetime) },
         data:  { isBooked: false },
       });
     });
@@ -338,11 +363,10 @@ async function handleConfirmingReschedule(
         `Is there anything else I can help you with?`);
     }
 
-    // Slot taken — re-fetch fresh options
     state.step         = 'rescheduling';
     state.selectedSlot = null;
     state.timeframe    = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   return sendDirect(res, sessionId, history, state,
@@ -352,7 +376,7 @@ async function handleConfirmingReschedule(
 
 async function handleShowingAvailability(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState, userText: string,
+  state: ConversationState, userText: string, orgId?: string,
 ): Promise<void> {
   const timeframe = detectTimeframe(userText);
   const openTf    = isOpenTimeframe(userText);
@@ -360,7 +384,7 @@ async function handleShowingAvailability(
   if (timeframe || openTf) {
     if (timeframe)   state.timeframe = timeframe;
     else if (openTf) state.timeframe = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   const slotIdx = detectSlotSelection(userText, state.slots);
@@ -372,7 +396,7 @@ async function handleShowingAvailability(
 
   if (isCancellation(userText)) {
     state.timeframe = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   return sendDirect(res, sessionId, history, state,
@@ -381,13 +405,13 @@ async function handleShowingAvailability(
 
 async function handleConfirmingBooking(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState, userText: string,
+  state: ConversationState, userText: string, orgId?: string,
 ): Promise<void> {
   if (isCancellation(userText)) {
     state.selectedSlot = null;
     state.step         = 'showing_availability';
     state.timeframe    = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   if (isConfirmation(userText)) {
@@ -402,6 +426,7 @@ async function handleConfirmingBooking(
       doctorId:     state.doctorId!,
       datetime:     state.selectedSlot!.datetime,
       sessionId,
+      isNewPatient: isNewPatient(state),
     });
 
     if (result.success) {
@@ -416,11 +441,10 @@ async function handleConfirmingBooking(
         ));
     }
 
-    // Slot was taken — re-fetch fresh options
     state.selectedSlot = null;
     state.step         = 'showing_availability';
     state.timeframe    = null;
-    return await fetchAndReturnSlots(res, sessionId, history, state);
+    return await fetchAndReturnSlots(res, sessionId, history, state, orgId);
   }
 
   return await respondWithAI(res, sessionId, history, state,
@@ -432,17 +456,20 @@ async function handleConfirmingBooking(
 
 async function fetchAndReturnSlots(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
-  state: ConversationState,
+  state: ConversationState, orgId?: string,
 ): Promise<void> {
-  const specialty = state.patient.specialty!;
+  const specialty    = state.patient.specialty!;
+  const newPatient   = isNewPatient(state);
 
   console.log('[chat] getAvailability params:', {
     specialty,
-    timeframe: state.timeframe ?? null,
-    serverNow: new Date().toISOString(),
+    orgId:        orgId ?? null,
+    isNewPatient: newPatient,
+    timeframe:    state.timeframe ?? null,
+    serverNow:    new Date().toISOString(),
   });
 
-  const avail = await getAvailability(specialty, state.timeframe ?? undefined);
+  const avail = await getAvailability(specialty, state.timeframe ?? undefined, orgId, newPatient);
 
   state.doctorId   = avail.doctorId;
   state.doctorName = avail.doctorName;
@@ -452,11 +479,17 @@ async function fetchAndReturnSlots(
     const label     = state.timeframe?.label ?? null;
     state.timeframe = null;
 
-    const msg = label === 'today'
-      ? `There are no available appointments today with ${avail.doctorName}. Would you like to check tomorrow or later this week?`
-      : label
-        ? `There are no available appointments for ${label} with ${avail.doctorName}. Would you like to try a different day or week?`
-        : `There are currently no available appointments with ${avail.doctorName}. Please call (555) 123-4567 or try a different timeframe.`;
+    // Build a rule-aware explanation so the patient knows WHY and what to do
+    const ruleNote = buildRuleExplanation(avail.blockedReasons, avail.doctorName || 'this provider');
+
+    let msg: string;
+    if (label === 'today') {
+      msg = `There are no available appointments today with ${avail.doctorName}. Would you like to check tomorrow or later this week?${ruleNote}`;
+    } else if (label) {
+      msg = `There are no available appointments for ${label} with ${avail.doctorName}. Would you like to try a different day or week?${ruleNote}`;
+    } else {
+      msg = `There are currently no available appointments with ${avail.doctorName}. Please call (555) 123-4567 or try a different timeframe.${ruleNote}`;
+    }
 
     return sendDirect(res, sessionId, history, state, msg);
   }
@@ -466,7 +499,7 @@ async function fetchAndReturnSlots(
     formatSlotsMessage(avail.doctorName, avail.slots, state.timeframe));
 }
 
-// ─── AI dispatch (conversational steps only — never for slot display) ─────────
+// ─── AI dispatch ──────────────────────────────────────────────────────────────
 
 async function respondWithAI(
   res: NextApiResponse, sessionId: string, history: StoredMessage[],
@@ -508,13 +541,11 @@ function guardAvailabilityResponse(reply: string, state: ConversationState): str
   const matches = [...reply.matchAll(timeRe)];
   if (matches.length === 0) return reply;
 
-  // collecting_info: AI must never mention a time
   if (state.step === 'collecting_info' || state.step === 'awaiting_timeframe') {
     console.warn('[guardrail] AI hallucinated time during intake — stripping');
     return reply.replace(/\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/gi, '').replace(/\s{2,}/g, ' ').trim();
   }
 
-  // confirming_booking: only the selected slot's time is valid
   if (state.step === 'confirming_booking' && state.selectedSlot) {
     const slotTime = state.selectedSlot.time.toUpperCase();
     const bad = matches.find(m => `${m[1]} ${m[2].toUpperCase()}` !== slotTime);
@@ -575,9 +606,9 @@ function buildExistingAppt(row: any): ExistingAppointment {
 
   return {
     id:           row.id,
-    doctorId:     row.doctorId,
-    doctorName:   row.doctor.name,
-    specialty:    row.doctor.specialty,
+    providerId:   row.providerId,
+    providerName: row.provider.name,
+    specialty:    row.provider.specialties[0] ?? '',
     formatted:    `${day} (${mm}/${dd}) at ${h}:00 ${ampm}`,
     datetime:     row.datetime.toISOString(),
     firstName:    row.firstName || row.patientName?.split(' ')[0] || '',
@@ -594,7 +625,7 @@ function returningPatientMsg(appt: ExistingAppointment): string {
   const firstName = appt.firstName || appt.patientName.split(' ')[0] || 'there';
   return (
     `Welcome back, ${firstName}! I found your existing appointment:\n\n` +
-    `  Doctor: ${appt.doctorName} (${appt.specialty})\n` +
+    `  Doctor: ${appt.providerName} (${appt.specialty})\n` +
     `  Time:   ${appt.formatted}\n\n` +
     `What would you like to do?\n` +
     `  1. Keep my appointment\n` +
@@ -603,7 +634,7 @@ function returningPatientMsg(appt: ExistingAppointment): string {
   );
 }
 
-// ─── AI context builders (collecting_info and confirming_booking only) ─────────
+// ─── AI context builders ──────────────────────────────────────────────────────
 
 function buildCollectingContext(p: ConversationState['patient'], doctorName: string | null): string {
   const collected: string[] = [];

@@ -49,9 +49,9 @@ export interface SlotOption {
 /** Snapshot of a found existing appointment — populated during returning-patient lookup. */
 export interface ExistingAppointment {
   id:           string;
-  doctorId:     string;
-  doctorName:   string;
-  specialty:    string;
+  providerId:   string;
+  providerName: string;
+  specialty:    string;   // the matched specialty string
   formatted:    string;   // "Friday (05/01) at 10:00 AM"
   datetime:     string;   // ISO
   firstName:    string;   // from the dedicated DB column; empty string for legacy rows
@@ -66,13 +66,14 @@ export interface ExistingAppointment {
 export interface ConversationState {
   step:                 ConversationStep;
   patient:              PatientInfo;
-  doctorId:             string | null;
+  doctorId:             string | null;   // actually stores Provider.id — kept as doctorId for session compat
   doctorName:           string | null;   // always from DB
   slots:                SlotOption[];
   selectedSlot:         SlotOption | null;
   appointmentId:        string | null;
   timeframe:            TimeframeFilter | null;
   existingAppointment:  ExistingAppointment | null;  // populated on returning-patient match
+  orgSlug:              string | null;   // set when patient enters via /org/[slug]
 }
 
 export function emptyState(): ConversationState {
@@ -89,6 +90,7 @@ export function emptyState(): ConversationState {
     appointmentId:       null,
     timeframe:           null,
     existingAppointment: null,
+    orgSlug:             null,
   };
 }
 
@@ -136,6 +138,40 @@ const SPECIALTY_MAP: Record<AllowedSpecialty, string[]> = {
     'neuropathy', 'concussion',
   ],
 };
+
+/**
+ * Given a user message and a list of provider specialties from the DB,
+ * returns the best-matching specialty string or null.
+ *
+ * Strategy:
+ *   1. Try existing keyword map — if it resolves to a known specialty AND that
+ *      specialty exists in the org's provider list, return it.
+ *   2. Fallback: scan each provider specialty for a direct substring match.
+ *
+ * This keeps the deterministic keyword logic but extends it to arbitrary DB values.
+ */
+export function mapToProviderSpecialty(
+  text: string,
+  allSpecialties: string[],
+): string | null {
+  const lower = text.toLowerCase();
+
+  // Step 1: keyword map hit
+  const knownSpecialty = mapToSpecialty(text);
+  if (knownSpecialty) {
+    const match = allSpecialties.find(
+      s => s.toLowerCase() === knownSpecialty.toLowerCase(),
+    );
+    if (match) return match;
+  }
+
+  // Step 2: direct substring — specialty name appears in user text
+  for (const spec of allSpecialties) {
+    if (lower.includes(spec.toLowerCase())) return spec;
+  }
+
+  return null;
+}
 
 /**
  * Maps a message to one of the allowed specialties, or null.

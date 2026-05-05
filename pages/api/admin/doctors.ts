@@ -1,6 +1,7 @@
 /**
  * GET /api/admin/doctors
- * Returns all doctors with their upcoming unbooked availability count.
+ * Returns all providers (across all orgs) with their upcoming unbooked availability count.
+ * Used by the Kyron-level admin dashboard.
  */
 
 import type { NextApiRequest, NextApiResponse } from 'next';
@@ -11,15 +12,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const doctors = await prisma.doctor.findMany({
+  const providers = await prisma.provider.findMany({
     include: {
+      organization: { select: { name: true, slug: true } },
       availability: {
         where: { datetime: { gte: new Date() } },
         orderBy: { datetime: 'asc' },
       },
     },
-    orderBy: { specialty: 'asc' },
+    orderBy: { name: 'asc' },
   });
+
+  // Shape response to preserve the "doctors" key for backward compat with app/admin/page.tsx
+  const doctors = providers.map(p => ({
+    id:           p.id,
+    name:         p.name,
+    specialty:    p.specialties.join(', '),   // display string
+    specialties:  p.specialties,
+    credentials:  p.credentials,
+    organization: p.organization,
+    availability: p.availability,
+  }));
 
   return res.status(200).json({ doctors });
 }

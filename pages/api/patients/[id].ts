@@ -18,7 +18,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
     const slot = await prisma.availability.findFirst({
-      where: { doctorId: appointment.doctorId, datetime: appointment.datetime },
+      where: { providerId: appointment.providerId, datetime: appointment.datetime },
     });
 
     await prisma.$transaction([

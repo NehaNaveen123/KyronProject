@@ -29,7 +29,7 @@ export async function sendConfirmationEmail(email: string, details: {
             <strong>Appointment time:</strong><br />
             ${details.time}
           </p>
-          <p>If you need to make changes, please call (555) 123-4567.</p>
+          <p>If you need to make changes, please call by clicking the Phone Icon above.</p>
           <p>Thank you,<br />Kyron Medical</p>
         </div>
       `,
@@ -39,7 +39,7 @@ export async function sendConfirmationEmail(email: string, details: {
         `Your appointment with ${details.doctorName} is confirmed.`,
         `Appointment time: ${details.time}`,
         '',
-        'If you need to make changes, please call (555) 123-4567.',
+        'If you need to make changes, please call by clicking the Phone Icon above.',
         '',
         'Thank you,',
         'Kyron Medical',
