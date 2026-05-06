@@ -34,6 +34,7 @@ model Organization {
   vogentPhoneId    String?    // Vogent phone number resource ID
   vogentPhoneNumber String?   // E.164 phone number e.g. +14155551234
   vogentCalls      VogentCall[]
+  phoneNumber      PhoneNumber?
   providers        Provider[]
   createdAt        DateTime   @default(now())
   updatedAt        DateTime   @updatedAt
@@ -119,4 +120,16 @@ model VogentCall {
   updatedAt      DateTime     @updatedAt
 
   @@index([organizationId, startedAt(sort: Desc)])
+}
+
+// Tracks provisioned inbound phone numbers (mock or real Vogent)
+model PhoneNumber {
+  id             String       @id @default(cuid())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId String       @unique   // one active number per org
+  number         String       @unique   // E.164: +1XXXXXXXXXX
+  type           String       @default("mock")   // "mock" | "vogent"
+  externalId     String?      // Vogent phone number resource ID (null for mock)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 }

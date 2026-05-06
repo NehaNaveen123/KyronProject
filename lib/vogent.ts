@@ -87,6 +87,12 @@ Once you have all information, use the get_availability function to find open sl
 - If a patient describes a medical emergency, instruct them to call 911 immediately.`;
 }
 
+// ─── Vogent resource IDs (verified against live API) ─────────────────────────
+// Voice: Emily (csm, standard)
+const VOICE_ID    = '94c32748-865f-42e1-bb1a-3a6b4abc7d11';
+// Model: Llama 3.3 70b Groq
+const AI_MODEL_ID = '387ba6dd-9a44-464c-99f0-660af50f008d';
+
 // ─── Agent creation ───────────────────────────────────────────────────────────
 
 const TOOL_BASE_URL = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
@@ -94,59 +100,62 @@ const TOOL_BASE_URL = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
 export async function createVogentAgent(org: OrgContext): Promise<string> {
   const systemPrompt = buildVogentSystemPrompt(org);
 
+  // Actual Vogent CreateAgentInput schema (confirmed against live API):
+  //   defaultVoiceId              — voice UUID (top-level)
+  //   defaultVersionedPrompt      — object with: name, prompt, aiModelId, agentType,
+  //                                 and optionally linkedFunctionDefinitions
   const body = {
-    name: `${org.name} Scheduler`,
-    prompt: systemPrompt,
-    voice: {
-      provider: 'deepgram',
-      voiceId: 'aura-asteria-en',
-    },
-    model: {
-      provider: 'groq',
-      model: 'llama-3.1-8b-instant',
-    },
-    linkedFunctionDefinitions: [
-      {
-        name: 'get_availability',
-        description: 'Look up available appointment slots for a given specialty.',
-        parameters: {
-          type: 'object',
-          properties: {
-            specialty: { type: 'string', description: 'Medical specialty requested (e.g. Cardiology)' },
-            isNewPatient: { type: 'boolean', description: 'True if patient has never been to this practice before' },
+    name:           `${org.name} Scheduler`,
+    defaultVoiceId: VOICE_ID,
+    defaultVersionedPrompt: {
+      name:        'v1',
+      prompt:      systemPrompt,
+      aiModelId:   AI_MODEL_ID,
+      agentType:   'STANDARD',
+      modelOptions: { max_tokens: 2000, temperature: 0.7 },
+      linkedFunctionDefinitions: [
+        {
+          name:        'get_availability',
+          description: 'Look up available appointment slots for a given specialty.',
+          parameters: {
+            type: 'object',
+            properties: {
+              specialty:    { type: 'string',  description: 'Medical specialty requested (e.g. Cardiology)' },
+              isNewPatient: { type: 'boolean', description: 'True if patient has never visited this practice' },
+            },
+            required: ['specialty'],
           },
-          required: ['specialty'],
+          url: `${TOOL_BASE_URL}/api/vogent/tool/availability?orgSlug=${org.slug}`,
         },
-        url: `${TOOL_BASE_URL}/api/vogent/tool/availability?orgSlug=${org.slug}`,
-      },
-      {
-        name: 'book_appointment',
-        description: 'Book a specific appointment slot for the patient.',
-        parameters: {
-          type: 'object',
-          properties: {
-            slotId:      { type: 'string',  description: 'Availability slot ID returned by get_availability' },
-            providerId:  { type: 'string',  description: 'Provider ID returned by get_availability' },
-            datetime:    { type: 'string',  description: 'ISO 8601 datetime of the slot' },
-            patientName: { type: 'string',  description: 'Full name of the patient' },
-            firstName:   { type: 'string',  description: 'Patient first name' },
-            lastName:    { type: 'string',  description: 'Patient last name' },
-            patientDob:  { type: 'string',  description: 'Date of birth (MM/DD/YYYY)' },
-            patientPhone:{ type: 'string',  description: 'Patient phone number' },
-            patientEmail:{ type: 'string',  description: 'Patient email address' },
-            reason:      { type: 'string',  description: 'Reason for visit' },
-            isNewPatient:{ type: 'boolean', description: 'Whether this is a new patient' },
+        {
+          name:        'book_appointment',
+          description: 'Book a specific appointment slot for the patient.',
+          parameters: {
+            type: 'object',
+            properties: {
+              slotId:       { type: 'string',  description: 'Availability slot ID returned by get_availability' },
+              providerId:   { type: 'string',  description: 'Provider ID returned by get_availability' },
+              datetime:     { type: 'string',  description: 'ISO 8601 datetime of the slot' },
+              patientName:  { type: 'string',  description: 'Full name of the patient' },
+              firstName:    { type: 'string',  description: 'Patient first name' },
+              lastName:     { type: 'string',  description: 'Patient last name' },
+              patientDob:   { type: 'string',  description: 'Date of birth (MM/DD/YYYY)' },
+              patientPhone: { type: 'string',  description: 'Patient phone number' },
+              patientEmail: { type: 'string',  description: 'Patient email address' },
+              reason:       { type: 'string',  description: 'Reason for visit' },
+              isNewPatient: { type: 'boolean', description: 'Whether this is a new patient' },
+            },
+            required: ['slotId', 'providerId', 'datetime', 'patientName', 'patientDob', 'patientPhone', 'patientEmail', 'reason'],
           },
-          required: ['slotId', 'providerId', 'datetime', 'patientName', 'patientDob', 'patientPhone', 'patientEmail', 'reason'],
+          url: `${TOOL_BASE_URL}/api/vogent/tool/book?orgSlug=${org.slug}`,
         },
-        url: `${TOOL_BASE_URL}/api/vogent/tool/book?orgSlug=${org.slug}`,
-      },
-    ],
+      ],
+    },
   };
 
   const data = await vogentFetch('/agents', {
     method: 'POST',
-    body: JSON.stringify(body),
+    body:   JSON.stringify(body),
   });
 
   const agentId = data.id ?? data.agentId;
@@ -156,24 +165,35 @@ export async function createVogentAgent(org: OrgContext): Promise<string> {
 
 // ─── Phone number provisioning ────────────────────────────────────────────────
 
+export async function searchPhoneNumbers(areaCode: string): Promise<string[]> {
+  // POST /phone_numbers/search with { prefix } — returns [{ number }]
+  const results = await vogentFetch('/phone_numbers/search', {
+    method: 'POST',
+    body:   JSON.stringify({ prefix: areaCode }),
+  }) as { number: string }[];
+
+  if (!Array.isArray(results)) return [];
+  return results.map(r => r.number);
+}
+
 export async function purchasePhoneNumber(
-  areaCode = '415',
+  areaCode = '650',
 ): Promise<{ phoneId: string; phoneNumber: string }> {
-  // Search for an available number
-  const search = await vogentFetch(`/phone_numbers/search?areaCode=${areaCode}`);
-  const available: string[] = search.numbers ?? search.availableNumbers ?? [];
-  if (!available.length) {
-    throw new Error(`No phone numbers available for area code ${areaCode}`);
+  const available = await searchPhoneNumbers(areaCode);
+
+  if (available.length === 0) {
+    throw new Error(`No phone numbers available for area code ${areaCode}. Try a different area code (e.g. 650 or 888).`);
   }
 
-  // Purchase the first result
+  // POST /phone_numbers/purchase with { number }
   const purchased = await vogentFetch('/phone_numbers/purchase', {
     method: 'POST',
-    body: JSON.stringify({ phoneNumber: available[0] }),
+    body:   JSON.stringify({ number: available[0] }),
   });
 
-  const phoneId = purchased.id ?? purchased.phoneNumberId;
-  const phoneNumber = purchased.phoneNumber ?? purchased.number ?? available[0];
+  // Response shape: { id, number, agentId, ... }
+  const phoneId     = purchased.id ?? purchased.phoneId;
+  const phoneNumber = purchased.number ?? purchased.phoneNumber ?? available[0];
   if (!phoneId) throw new Error(`Phone purchase returned no id: ${JSON.stringify(purchased)}`);
 
   return { phoneId: phoneId as string, phoneNumber: phoneNumber as string };
@@ -182,18 +202,47 @@ export async function purchasePhoneNumber(
 export async function linkPhoneToAgent(phoneId: string, agentId: string): Promise<void> {
   await vogentFetch(`/phone_numbers/${phoneId}`, {
     method: 'PUT',
-    body: JSON.stringify({ agentId }),
+    body:   JSON.stringify({ agentId }),
   });
 }
 
-// ─── Full provisioning flow ───────────────────────────────────────────────────
+// ─── Provisioning flows ───────────────────────────────────────────────────────
 
-export async function provisionOrg(
+/** Step 1 — create the AI agent only (no phone purchase, always free). */
+export async function provisionAgent(
   org: OrgContext,
-  areaCode = '415',
-): Promise<{ agentId: string; phoneId: string; phoneNumber: string }> {
+): Promise<{ agentId: string }> {
   const agentId = await createVogentAgent(org);
+  return { agentId };
+}
+
+/** Step 2a — purchase a new number and link it (requires Vogent credits). */
+export async function provisionPhone(
+  agentId:  string,
+  areaCode = '650',
+): Promise<{ phoneId: string; phoneNumber: string }> {
   const { phoneId, phoneNumber } = await purchasePhoneNumber(areaCode);
   await linkPhoneToAgent(phoneId, agentId);
+  return { phoneId, phoneNumber };
+}
+
+/** Step 2b — link an existing Vogent phone number ID (no purchase needed). */
+export async function linkExistingPhone(
+  agentId:     string,
+  phoneId:     string,
+  phoneNumber: string,
+): Promise<void> {
+  await linkPhoneToAgent(phoneId, agentId);
+  // phoneNumber is stored by the caller — just ensure the link is made
+  void phoneNumber;
+}
+
+/** Legacy all-in-one flow. */
+export async function provisionOrg(
+  org: OrgContext,
+  areaCode = '650',
+): Promise<{ agentId: string; phoneId: string; phoneNumber: string }> {
+  const { agentId } = await provisionAgent(org);
+  const { phoneId, phoneNumber } = await provisionPhone(agentId, areaCode);
   return { agentId, phoneId, phoneNumber };
 }

@@ -667,44 +667,67 @@ function ProvidersTab({ slug }: { slug: string }) {
 // ─── Phone Tab ────────────────────────────────────────────────────────────────
 
 function PhoneTab({ slug }: { slug: string }) {
+  const [agentId,     setAgentId]     = useState<string | null>(null);
   const [phoneNumber, setPhoneNumber] = useState<string | null>(null);
+  const [phoneType,   setPhoneType]   = useState<string | null>(null);
   const [loading,     setLoading]     = useState(true);
-  const [provisioning,setProvisioning]= useState(false);
-  const [areaCode,    setAreaCode]    = useState('415');
+  const [busy,        setBusy]        = useState(false);
+  const [simBusy,     setSimBusy]     = useState(false);
   const [feedback,    setFeedback]    = useState('');
   const [error,       setError]       = useState('');
+  const [hint,        setHint]        = useState('');
+  const [lastSim,     setLastSim]     = useState<{ patientName: string; duration: number; booked: boolean } | null>(null);
 
-  function flash(msg: string, isErr = false) {
-    if (isErr) setError(msg); else setFeedback(msg);
-    setTimeout(() => { setFeedback(''); setError(''); }, 6000);
-  }
+  function flashOk(msg: string) { setFeedback(msg); setError(''); setHint(''); setTimeout(() => setFeedback(''), 7000); }
+  function flashErr(msg: string, h = '') { setError(msg); setHint(h); setFeedback(''); setTimeout(() => { setError(''); setHint(''); }, 12000); }
 
   const load = useCallback(async () => {
     setLoading(true);
     const res  = await fetch(`/api/org/${slug}/me`);
     const data = await res.json();
+    setAgentId(data.org?.vogentAgentId ?? null);
     setPhoneNumber(data.org?.vogentPhoneNumber ?? null);
+
+    // Check PhoneNumber table for type
+    if (data.org?.vogentPhoneNumber) {
+      const pRes  = await fetch(`/api/org/${slug}/phone-info`);
+      if (pRes.ok) {
+        const pData = await pRes.json();
+        setPhoneType(pData.type ?? 'mock');
+      }
+    }
     setLoading(false);
   }, [slug]);
 
   useEffect(() => { load(); }, [load]);
 
-  async function provision() {
-    if (!confirm(
-      `This will purchase a dedicated phone number (area code ${areaCode}) for this organization and provision a Vogent AI agent. Continue?`
-    )) return;
-    setProvisioning(true);
-    setError('');
-    const res  = await fetch('/api/vogent/provision', {
+  async function registerNumber() {
+    setBusy(true); setError('');
+    const res  = await fetch('/api/phone-numbers/register', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ slug, areaCode }),
+      body:    JSON.stringify({ slug }),
     });
     const data = await res.json();
-    setProvisioning(false);
-    if (!res.ok) return flash(data.error ?? 'Provisioning failed', true);
+    setBusy(false);
+    if (!res.ok) return flashErr(data.error ?? 'Registration failed', data.hint);
     setPhoneNumber(data.phoneNumber);
-    flash(`Phone number provisioned: ${data.phoneNumber}. Patients can now call this number directly.`);
+    setPhoneType(data.type);
+    flashOk(`Phone number registered: ${data.phoneNumber} (${data.type === 'mock' ? 'demo number' : 'Vogent'}). Patients can now call this number.`);
+  }
+
+  async function simulateCall() {
+    setSimBusy(true); setError('');
+    const res  = await fetch('/api/vogent/simulate-call', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ slug, bookAppointment: true }),
+    });
+    const data = await res.json();
+    setSimBusy(false);
+    if (!res.ok) return flashErr(data.error ?? 'Simulation failed');
+    setLastSim({ patientName: data.patientName, duration: data.duration, booked: !!data.appointmentId });
+    flashOk(`Simulated call from ${data.patientName} (${data.duration}s)${data.appointmentId ? ' — appointment booked' : ''}. Check the Call Log tab.`);
   }
 
   if (loading) {
@@ -717,98 +740,125 @@ function PhoneTab({ slug }: { slug: string }) {
 
   return (
     <div className="max-w-2xl space-y-4">
-      {feedback && (
-        <div className="rounded-lg bg-green-50 border border-green-200 px-4 py-3 text-sm text-green-800">
-          {feedback}
-        </div>
-      )}
+      {feedback && <div className="rounded-lg bg-green-50 border border-green-200 px-4 py-3 text-sm text-green-800">{feedback}</div>}
       {error && (
         <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
-          {error}
+          <p className="font-medium">{error}</p>
+          {hint && <p className="mt-1 text-xs text-red-600">{hint}</p>}
         </div>
       )}
 
+      {/* ── Status card ── */}
       <section className="rounded-xl border border-slate-200 bg-white p-6">
-        <h2 className="text-sm font-semibold text-slate-800 mb-1">Dedicated Inbound Phone Line</h2>
-        <p className="text-xs text-slate-500 mb-5">
-          Give your patients a direct phone number to book appointments without a browser.
-          An AI agent scoped to your providers, availability, and scheduling rules handles
-          the entire call — collecting patient info, matching to the right provider, and
-          confirming the booking.
-        </p>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-semibold text-slate-800">Inbound Phone Line</h2>
+          {phoneType === 'mock' && (
+            <span className="rounded-full bg-amber-50 border border-amber-200 px-2.5 py-0.5 text-xs font-medium text-amber-700">
+              Demo mode
+            </span>
+          )}
+          {phoneType === 'vogent' && (
+            <span className="rounded-full bg-green-50 border border-green-200 px-2.5 py-0.5 text-xs font-medium text-green-700">
+              Live (Vogent)
+            </span>
+          )}
+        </div>
 
         {phoneNumber ? (
-          <div className="rounded-xl bg-blue-50 border border-blue-200 px-5 py-4 flex items-center justify-between">
+          <div className="rounded-xl bg-blue-50 border border-blue-200 px-5 py-4 flex items-center gap-4">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-xl shrink-0">📞</div>
             <div>
-              <p className="text-xs font-medium text-blue-600 mb-0.5">Active phone number</p>
-              <p className="text-2xl font-bold text-blue-900 tracking-wide">{phoneNumber}</p>
-              <p className="mt-1 text-xs text-blue-700">
-                Patients can call this number any time to schedule an appointment.
+              <p className="text-xs font-medium text-blue-600 mb-0.5">
+                {phoneType === 'mock' ? 'Demo phone number' : 'Active phone number'}
               </p>
-            </div>
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-100 text-2xl shrink-0 ml-4">
-              📞
+              <p className="text-xl font-bold text-blue-900 tracking-wide">{phoneNumber}</p>
+              {phoneType === 'mock' && (
+                <p className="text-xs text-blue-600 mt-0.5">This is a demo number — use &quot;Simulate call&quot; to test the full flow.</p>
+              )}
             </div>
           </div>
         ) : (
           <div className="rounded-xl border border-dashed border-slate-200 px-5 py-8 text-center">
             <div className="text-3xl mb-2">📵</div>
-            <p className="text-sm text-slate-600 font-medium mb-1">No phone number provisioned yet</p>
-            <p className="text-xs text-slate-400">
-              Provision a number to enable inbound phone booking for this practice.
-            </p>
+            <p className="text-sm text-slate-600 font-medium mb-1">No phone number registered yet</p>
+            <p className="text-xs text-slate-400">Register a number to enable inbound phone scheduling for this practice.</p>
           </div>
         )}
       </section>
 
-      <section className="rounded-xl border border-slate-200 bg-white p-6">
-        <h3 className="text-sm font-semibold text-slate-800 mb-1">
-          {phoneNumber ? 'Re-provision' : 'Provision a number'}
-        </h3>
-        <p className="text-xs text-slate-500 mb-4">
-          {phoneNumber
-            ? 'Purchase a new number and link it to a fresh agent. The old number will be replaced.'
-            : 'Purchase a dedicated inbound number via Vogent. The AI agent is automatically configured with your current providers and scheduling rules.'}
-        </p>
-
-        <div className="flex items-end gap-3">
-          <div>
-            <label className="block text-xs font-medium text-slate-600 mb-1">Preferred area code</label>
-            <input
-              type="text"
-              maxLength={3}
-              className="w-24 rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
-              value={areaCode}
-              onChange={e => setAreaCode(e.target.value.replace(/\D/g, '').slice(0, 3))}
-              placeholder="415"
-            />
-          </div>
+      {/* ── Register / Simulate actions ── */}
+      <section className="rounded-xl border border-slate-200 bg-white p-6 space-y-5">
+        {/* Register number */}
+        <div>
+          <h3 className="text-sm font-semibold text-slate-800 mb-1">
+            {phoneNumber ? 'Re-register phone number' : 'Register phone number'}
+          </h3>
+          <p className="text-xs text-slate-500 mb-3">
+            {phoneType === 'mock'
+              ? 'Assigns a realistic demo number. Switch to live mode by setting PHONE_PROVIDER=vogent in your environment.'
+              : phoneNumber
+              ? 'Assigns a new number via the configured phone provider.'
+              : 'Assigns a phone number via the configured phone provider (demo by default).'}
+          </p>
           <button
-            onClick={provision}
-            disabled={provisioning || areaCode.length !== 3}
+            onClick={registerNumber}
+            disabled={busy}
             className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
           >
-            {provisioning ? 'Provisioning…' : phoneNumber ? 'Re-provision' : 'Provision number'}
+            {busy ? 'Registering…' : phoneNumber ? 'Re-register' : 'Register Phone Number'}
           </button>
         </div>
 
-        <div className="mt-4 rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 text-xs text-amber-800">
-          <strong>Note:</strong> Provisioning requires a valid <code>VOGENT_API_KEY</code> in your
-          server environment. Phone numbers incur usage charges billed through Vogent.
-          Agent prompts are built from your <em>current</em> providers and rules — re-provision
-          if you make significant changes.
-        </div>
+        {/* Simulate call — only shown when a number is registered */}
+        {phoneNumber && (
+          <div className="border-t border-slate-100 pt-5">
+            <h3 className="text-sm font-semibold text-slate-800 mb-1">Simulate inbound call</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              Creates a realistic mock call record — with a full transcript, patient info, and a real appointment booking — so you can preview the Call Log tab without placing an actual phone call.
+            </p>
+            <button
+              onClick={simulateCall}
+              disabled={simBusy}
+              className="rounded-lg border border-slate-200 bg-white px-5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 flex items-center gap-2"
+            >
+              <span>{simBusy ? '📞 Simulating…' : '📞 Simulate call'}</span>
+            </button>
+            {lastSim && (
+              <p className="mt-2 text-xs text-slate-500">
+                Last sim: <span className="font-medium">{lastSim.patientName}</span> ({lastSim.duration}s)
+                {lastSim.booked ? ' — appointment booked ✓' : ''}
+              </p>
+            )}
+          </div>
+        )}
       </section>
 
+      {/* ── Provider info ── */}
+      <section className="rounded-xl border border-slate-200 bg-white p-6">
+        <h3 className="text-sm font-semibold text-slate-800 mb-2">Phone provider</h3>
+        <div className="flex items-center gap-3 text-xs text-slate-600">
+          <span className={`h-2 w-2 rounded-full ${phoneType === 'vogent' ? 'bg-green-500' : 'bg-amber-400'}`} />
+          <span>
+            {phoneType === 'vogent'
+              ? 'Vogent (live) — real inbound calls, requires API credits'
+              : 'Mock (demo) — simulated calls only, no external API'}
+          </span>
+        </div>
+        <p className="mt-2 text-xs text-slate-400">
+          Switch providers by setting <code className="bg-slate-100 px-1 rounded">PHONE_PROVIDER=vogent</code> in your server environment and re-registering.
+        </p>
+      </section>
+
+      {/* ── How it works ── */}
       <section className="rounded-xl border border-slate-200 bg-white p-6">
         <h3 className="text-sm font-semibold text-slate-800 mb-2">How it works</h3>
         <ol className="space-y-2 text-xs text-slate-600 list-decimal list-inside">
-          <li>Patient dials the number above.</li>
-          <li>Vogent&apos;s AI answers and greets the patient on behalf of {`your practice`}.</li>
-          <li>The agent collects name, date of birth, phone, email, and reason for visit.</li>
-          <li>It checks real-time availability for the right provider and reads out open slots.</li>
-          <li>Patient confirms a time — the appointment is booked instantly in your system.</li>
-          <li>A confirmation email is sent to the patient automatically.</li>
+          <li>Patient dials the number above (real call with Vogent, or simulated in demo mode).</li>
+          <li>The AI agent greets the patient on behalf of your practice.</li>
+          <li>It collects name, date of birth, phone, email, and reason for visit.</li>
+          <li>It checks real-time availability and reads out open slots.</li>
+          <li>Patient confirms — appointment is booked and a confirmation email is sent.</li>
+          <li>The full call log (transcript, patient info, booking) appears in the Call Log tab.</li>
         </ol>
       </section>
     </div>
