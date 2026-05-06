@@ -2,8 +2,10 @@
  * POST /api/vogent/tool/book?orgSlug=<slug>
  *
  * Vogent calls this webhook when the agent invokes book_appointment.
- * Delegates to the existing bookAppointment() function and then writes
- * the booking result back to the VogentCall record.
+ * Returns a structured { confirmed, scheduledTime, message } object so the
+ * agent can decide what to say based on whether the DB insert succeeded.
+ *
+ * IMPORTANT: The agent must ONLY say "you are booked" when confirmed === true.
  */
 
 import type { NextApiRequest, NextApiResponse } from 'next';
@@ -21,8 +23,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const { orgSlug } = req.query as { orgSlug: string };
 
-  const body = req.body as Record<string, unknown>;
-  // dialId is at the top level of the webhook body (not inside parameters)
+  const body   = req.body as Record<string, unknown>;
+  // dialId sits at the top level of the Vogent webhook payload
   const dialId = (body.dialId ?? body.callId ?? body.dial_id) as string | undefined;
 
   const params = (body.parameters ?? body.arguments ?? body) as Record<string, unknown>;
@@ -58,11 +60,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   if (missing.length > 0) {
     return res.status(200).json({
-      result: `Missing required information: ${missing.join(', ')}. Please collect this from the patient before booking.`,
+      result: {
+        confirmed: false,
+        message:   `Missing required information: ${missing.join(', ')}. Please collect this from the patient before booking.`,
+      },
     });
   }
 
-  // Update call record with patient info (even before we know if booking succeeds)
+  // Persist patient info to the call record before attempting the booking
   if (dialId) {
     await prisma.vogentCall.updateMany({
       where: { dialId },
@@ -78,6 +83,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     const result = await bookAppointment({
+      slotId,
       doctorId:     providerId,
       datetime,
       patientName,
@@ -92,31 +98,63 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
 
     if (!result.success) {
+      // Booking failed — update call record with "failed" outcome, then tell the agent
+      if (dialId) {
+        await prisma.vogentCall.updateMany({
+          where: { dialId },
+          data:  { bookingOutcome: 'failed' },
+        }).catch(err => console.error('[vogent/tool/book] outcome update failed:', err));
+      }
+
       return res.status(200).json({
-        result: `Unable to book the appointment: ${result.error}. Please offer the patient an alternative slot.`,
+        result: {
+          confirmed: false,
+          message:   `I'm not seeing availability right now—let me offer alternatives. (${result.error})`,
+        },
       });
     }
 
-    // Link the appointment to the call record
+    const scheduledTime = new Date(datetime!);
+
+    // Link the appointment to the call record and record outcome
     if (dialId) {
       await prisma.vogentCall.updateMany({
         where: { dialId },
         data: {
-          appointmentId: result.appointmentId,
-          bookedAt:      new Date(),
+          appointmentId:  result.appointmentId,
+          bookedAt:       new Date(),
+          bookingOutcome: 'confirmed',
+          scheduledTime,
         },
       }).catch(err => console.error('[vogent/tool/book] appointment link failed:', err));
     }
 
     return res.status(200).json({
       result: {
+        confirmed:     true,
         appointmentId: result.appointmentId,
-        message: `Appointment confirmed! ${result.patientFirstName}, your appointment with ${result.doctorName} is booked for ${result.formatted}. A confirmation email has been sent to ${patientEmail}.`,
+        scheduledTime: result.formatted,  // human-readable e.g. "Tuesday (05/06) at 10:30 AM"
+        providerName:  result.doctorName,
+        // The agent must read this line verbatim to the patient
+        message:       `You are booked with ${result.doctorName} on ${result.formatted}. A confirmation email has been sent to ${patientEmail}.`,
       },
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[vogent/tool/book] error:', message);
-    return res.status(200).json({ result: `An error occurred while booking: ${message}` });
+
+    if (dialId) {
+      await prisma.vogentCall.updateMany({
+        where: { dialId },
+        data:  { bookingOutcome: 'failed' },
+      }).catch(() => {});
+    }
+
+    return res.status(200).json({
+      result: {
+        confirmed: false,
+        message:   `I'm not seeing availability right now—let me offer alternatives.`,
+      },
+    });
   }
 }

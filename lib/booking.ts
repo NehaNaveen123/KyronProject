@@ -23,22 +23,28 @@ function et(date: Date) {
   return toZonedTime(date, TZ);
 }
 
+// Day name lookup — used instead of toLocaleDateString so the result is
+// based on the UTC fields that toZonedTime writes, not the server's local TZ.
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
 function format(dt: Date) {
+  // toZonedTime stores the ET local time in the Date's UTC fields.
+  // Always read via getUTC* so this works on any server timezone (Mac, Linux, etc.)
   const d = et(dt);
 
-  const day = d.toLocaleDateString('en-US', { weekday: 'long' });
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
+  const day = WEEKDAY_NAMES[d.getUTCDay()];
+  const mm  = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd  = String(d.getUTCDate()).padStart(2, '0');
 
-  let h = d.getHours();
+  let h = d.getUTCHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
-  const min = d.getMinutes();
+  const min    = d.getUTCMinutes();
   const minStr = min === 0 ? '00' : String(min).padStart(2, '0');
 
   return {
-    date: `${day} (${mm}/${dd})`,
-    time: `${h}:${minStr} ${ampm}`,
+    date:      `${day} (${mm}/${dd})`,
+    time:      `${h}:${minStr} ${ampm}`,
     formatted: `${day} (${mm}/${dd}) at ${h}:${minStr} ${ampm}`,
   };
 }
@@ -46,12 +52,12 @@ function format(dt: Date) {
 /**
  * Validates that a datetime falls on a valid clinic-hour boundary in ET.
  * Accepts both :00 and :30 minute slots within clinic hours (9–17 ET).
- * Exported so the admin API and slot generator can reuse the same guard.
+ * Uses getUTC* because toZonedTime stores ET local time in the UTC fields.
  */
 export function isValidSlotTime(dt: Date): boolean {
   const etTime = toZonedTime(dt, TZ);
-  const etHour = etTime.getHours();
-  const etMin  = etTime.getMinutes();
+  const etHour = etTime.getUTCHours();
+  const etMin  = etTime.getUTCMinutes();
   return HOURS.includes(etHour) && (etMin === 0 || etMin === 30) && dt.getSeconds() === 0 && dt.getMilliseconds() === 0;
 }
 
@@ -209,11 +215,9 @@ export async function bookAppointment(params: any) {
   }
 
   const slot = await prisma.availability.findFirst({
-    where: {
-      providerId: params.doctorId,
-      datetime:   dt,
-      isBooked:   false,
-    },
+    where: params.slotId
+      ? { id: params.slotId, isBooked: false }
+      : { providerId: params.doctorId, datetime: dt, isBooked: false },
     select: {
       id:       true,
       isBooked: true,

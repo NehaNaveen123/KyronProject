@@ -6,6 +6,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { prisma } from '../../../../lib/db';
 import { requireAdmin } from '../../../../lib/auth';
+import { generateProviderSlots } from '../../../../lib/providerSlots';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { slug } = req.query as { slug: string };
@@ -47,6 +48,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         organizationId:  org.id,
       },
     });
+
+    // Generate 7 days of default availability (9 AM–5 PM ET, weekdays, 30-min slots)
+    generateProviderSlots(provider.id).catch(err =>
+      console.error('[providers] slot generation failed:', err),
+    );
+
     return res.status(201).json({ provider });
   }
 

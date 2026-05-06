@@ -4,6 +4,10 @@
  * Admin-only. Creates a mock inbound call record for an org, optionally
  * booking a real appointment, so the Call Log tab shows end-to-end data.
  *
+ * - Picks a reason whose specialty matches a provider at this org.
+ * - If the matched provider has no slots yet, generates them on-the-fly.
+ * - Records bookingOutcome "confirmed" / "failed" / null (no matching provider).
+ *
  * Body: { slug: string, bookAppointment?: boolean }
  */
 
@@ -11,23 +15,65 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { prisma } from '../../../lib/db';
 import { requireAdmin } from '../../../lib/auth';
 import { bookAppointment } from '../../../lib/booking';
+import { generateProviderSlots } from '../../../lib/providerSlots';
 import { v4 as uuidv4 } from 'uuid';
 
 const FIRST_NAMES = ['James', 'Maria', 'Robert', 'Linda', 'Michael', 'Patricia', 'David', 'Jennifer', 'William', 'Barbara'];
 const LAST_NAMES  = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Wilson', 'Moore'];
-const REASONS = [
-  'Annual checkup and blood pressure review',
-  'Follow-up on recent lab results',
-  'Persistent lower back pain for 3 weeks',
-  'Skin rash on forearm, itchy and spreading',
-  'Routine dental cleaning and exam',
-  'Knee pain after running',
-  'Migraine headaches, 2–3 times per week',
-  'New patient consultation',
+
+// Reasons paired with the specialties that should handle them.
+// Multiple reasons per specialty so simulations vary.
+const REASONS: { text: string; specialties: string[] }[] = [
+  // Cardiology
+  { text: 'Chest tightness and shortness of breath',      specialties: ['Cardiology'] },
+  { text: 'Heart palpitations when exercising',           specialties: ['Cardiology'] },
+  { text: 'High blood pressure follow-up',                specialties: ['Cardiology', 'Internal Medicine', 'Family Medicine'] },
+  { text: 'Irregular heartbeat noticed recently',         specialties: ['Cardiology'] },
+  { text: 'Dizziness and lightheadedness',                specialties: ['Cardiology', 'Neurology', 'Internal Medicine'] },
+
+  // Orthopedics / Sports Medicine
+  { text: 'Knee pain after running',                      specialties: ['Orthopedics', 'Orthopedic Surgery', 'Sports Medicine'] },
+  { text: 'Persistent lower back pain for 3 weeks',       specialties: ['Orthopedics', 'Orthopedic Surgery', 'Sports Medicine', 'Physical Therapy'] },
+  { text: 'Shoulder pain and limited range of motion',    specialties: ['Orthopedics', 'Orthopedic Surgery', 'Sports Medicine'] },
+  { text: 'Ankle sprain that has not healed',             specialties: ['Orthopedics', 'Sports Medicine'] },
+
+  // Dermatology
+  { text: 'Skin rash on forearm, itchy and spreading',    specialties: ['Dermatology'] },
+  { text: 'Acne that has worsened over the past month',   specialties: ['Dermatology'] },
+  { text: 'Mole that changed color and size',             specialties: ['Dermatology'] },
+  { text: 'Dry, flaky patches on scalp and face',         specialties: ['Dermatology'] },
+
+  // Neurology
+  { text: 'Migraine headaches two to three times a week', specialties: ['Neurology', 'Family Medicine', 'Internal Medicine'] },
+  { text: 'Numbness and tingling in hands and feet',      specialties: ['Neurology'] },
+  { text: 'Memory lapses and difficulty concentrating',   specialties: ['Neurology', 'Psychiatry'] },
+
+  // General / Family / Internal Medicine
+  { text: 'Annual checkup and routine blood work',        specialties: ['Family Medicine', 'Internal Medicine', 'General Practice', 'Primary Care'] },
+  { text: 'Follow-up on recent lab results',              specialties: ['Family Medicine', 'Internal Medicine', 'General Practice', 'Primary Care'] },
+  { text: 'New patient consultation',                     specialties: ['Family Medicine', 'Internal Medicine', 'General Practice', 'Primary Care'] },
+  { text: 'Persistent fatigue and low energy',            specialties: ['Family Medicine', 'Internal Medicine', 'General Practice', 'Primary Care'] },
+
+  // Psychiatry / Psychology
+  { text: 'Anxiety and difficulty sleeping',              specialties: ['Psychiatry', 'Psychology', 'Family Medicine', 'Internal Medicine'] },
+  { text: 'Persistent low mood and loss of motivation',   specialties: ['Psychiatry', 'Psychology'] },
+
+  // Dentistry
+  { text: 'Routine dental cleaning and exam',             specialties: ['Dentistry', 'Dental'] },
+  { text: 'Tooth pain and sensitivity to cold',           specialties: ['Dentistry', 'Dental'] },
 ];
 
 function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function shuffle<T>(arr: T[]): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
 }
 
 function randomPhone(): string {
@@ -41,9 +87,15 @@ function randomDob(): string {
   return `${month}/${day}/${year}`;
 }
 
-function buildTranscript(patientName: string, providerName: string, specialty: string, slotDisplay: string, reason: string): string {
+function buildTranscript(
+  patientName:  string,
+  providerName: string | null,
+  specialty:    string,
+  slotDisplay:  string | null,
+  reason:       string,
+): string {
   const [first] = patientName.split(' ');
-  return [
+  const lines = [
     `Agent: Thank you for calling. I'm the scheduling assistant. How can I help you today?`,
     `Patient: Hi, I need to book an appointment for ${reason.toLowerCase()}.`,
     `Agent: Of course! I can help you with that. Could I get your full name?`,
@@ -54,12 +106,33 @@ function buildTranscript(patientName: string, providerName: string, specialty: s
     `Patient: You can use the number I'm calling from.`,
     `Agent: And an email address for your confirmation?`,
     `Patient: Sure, it's ${first.toLowerCase()}@example.com.`,
-    `Agent: Perfect. I'm looking for ${specialty} providers for you. I have ${providerName} available on ${slotDisplay}. Does that work for you?`,
-    `Patient: Yes, that works perfectly.`,
-    `Agent: Great! I've booked your appointment with ${providerName} for ${slotDisplay}. You'll receive a confirmation email shortly. Is there anything else I can help you with?`,
-    `Patient: No, that's everything. Thank you!`,
-    `Agent: You're welcome, ${first}. We look forward to seeing you. Have a great day!`,
-  ].join('\n');
+  ];
+
+  if (providerName && slotDisplay) {
+    lines.push(
+      `Agent: I'm looking for a ${specialty} provider for you. I have ${providerName} available on ${slotDisplay}. Does that work for you?`,
+      `Patient: Yes, that works perfectly.`,
+      `Agent: You are booked with ${providerName} on ${slotDisplay}. You'll receive a confirmation email shortly. Is there anything else I can help you with?`,
+      `Patient: No, that's everything. Thank you!`,
+      `Agent: You're welcome, ${first}. We look forward to seeing you. Have a great day!`,
+    );
+  } else if (providerName) {
+    // Provider exists but no slot was available
+    lines.push(
+      `Agent: I checked and unfortunately ${providerName} doesn't have any openings in the next 7 days for ${specialty}. Would you like me to check back in another week, or is there anything else I can help with?`,
+      `Patient: I'll try calling back later. Thank you.`,
+      `Agent: Of course, ${first}. Have a great day!`,
+    );
+  } else {
+    // No matching provider at all
+    lines.push(
+      `Agent: I checked our providers and unfortunately we don't currently have a ${specialty} specialist at this location. I'd be happy to take a message for the front desk who can refer you.`,
+      `Patient: Oh I see. I'll look for another clinic then.`,
+      `Agent: Of course, ${first}. I'm sorry we couldn't help today. Have a great day!`,
+    );
+  }
+
+  return lines.join('\n');
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -77,38 +150,65 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   });
   if (!org) return res.status(404).json({ error: 'Organization not found' });
 
-  const firstName   = pick(FIRST_NAMES);
-  const lastName    = pick(LAST_NAMES);
-  const patientName = `${firstName} ${lastName}`;
-  const patientDob  = randomDob();
+  const firstName    = pick(FIRST_NAMES);
+  const lastName     = pick(LAST_NAMES);
+  const patientName  = `${firstName} ${lastName}`;
+  const patientDob   = randomDob();
   const patientPhone = randomPhone();
   const patientEmail = `${firstName.toLowerCase()}.${lastName.toLowerCase()}@example.com`;
-  const reason       = pick(REASONS);
 
   const dialId  = `mock-${uuidv4()}`;
   const agentId = org.vogentAgentId ?? `mock-agent-${org.id.slice(0, 8)}`;
 
-  // Try to find a real available slot and book it
-  let appointmentId: string | undefined;
-  let slotDisplay   = 'a convenient time';
-  let providerName  = 'your provider';
-  let specialty     = 'General Medicine';
+  // Collect all specialties at this org (lowercase for matching)
+  const orgSpecialtySet = new Set(
+    org.providers.flatMap(p => p.specialties.map(s => s.toLowerCase())),
+  );
 
-  if (shouldBook && org.providers.length > 0) {
-    const provider = pick(org.providers);
-    providerName   = provider.name;
-    specialty      = provider.specialties[0] ?? 'General Medicine';
+  // Shuffle reasons and pick one whose specialty exists at this org.
+  // Fall back to any reason if the org has no matching specialty.
+  const shuffledReasons = shuffle(REASONS);
+  const matchedReasons  = shuffledReasons.filter(r =>
+    r.specialties.some(s => orgSpecialtySet.has(s.toLowerCase())),
+  );
+  const chosenReason = matchedReasons[0] ?? shuffledReasons[0];
+  const reason       = chosenReason.text;
 
+  // Find the provider who covers this reason's specialty
+  const matchedProvider = org.providers.find(p =>
+    p.specialties.some(s =>
+      chosenReason.specialties.some(cs => cs.toLowerCase() === s.toLowerCase()),
+    ),
+  ) ?? null;
+
+  let appointmentId:  string | undefined;
+  let bookedSlotTime: Date   | undefined;
+  let slotDisplay:    string | null = null;
+  const providerName = matchedProvider?.name ?? null;
+  const specialty    = matchedProvider?.specialties[0] ?? chosenReason.specialties[0] ?? 'General Medicine';
+
+  if (shouldBook && matchedProvider) {
+    // Ensure this provider has future availability — generate if missing
+    const existingSlot = await prisma.availability.findFirst({
+      where:  { providerId: matchedProvider.id, isBooked: false, datetime: { gt: new Date() } },
+      select: { id: true },
+    });
+
+    if (!existingSlot) {
+      await generateProviderSlots(matchedProvider.id, 14); // 2 weeks
+    }
+
+    // Find the first available slot
     const slot = await prisma.availability.findFirst({
-      where:   { providerId: provider.id, isBooked: false, datetime: { gt: new Date() } },
+      where:   { providerId: matchedProvider.id, isBooked: false, datetime: { gt: new Date() } },
       orderBy: { datetime: 'asc' },
       select:  { id: true, datetime: true },
     });
 
     if (slot) {
-      const sessionId = `simulate-${dialId}`;
-      const result    = await bookAppointment({
-        doctorId:     provider.id,
+      const result = await bookAppointment({
+        slotId:       slot.id,
+        doctorId:     matchedProvider.id,
         datetime:     slot.datetime.toISOString(),
         patientName,
         firstName,
@@ -118,21 +218,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         patientEmail,
         reason,
         isNewPatient: true,
-        sessionId,
+        sessionId:    `simulate-${dialId}`,
       });
 
       if (result.success) {
-        appointmentId = result.appointmentId;
-        slotDisplay   = result.formatted;
+        appointmentId  = result.appointmentId;
+        slotDisplay    = result.formatted;
+        bookedSlotTime = slot.datetime;
       }
     }
   }
 
-  const transcript = buildTranscript(patientName, providerName, specialty, slotDisplay, reason);
-  const summary    = `Patient ${patientName} called to book a ${specialty.toLowerCase()} appointment. Reason: ${reason}. ${appointmentId ? `Appointment confirmed with ${providerName} for ${slotDisplay}.` : 'No appointment booked.'}`;
-  const duration   = 60 + Math.floor(Math.random() * 180); // 1–4 min
+  const bookingOutcome = appointmentId
+    ? 'confirmed'
+    : matchedProvider
+      ? 'failed'
+      : null;
 
-  const startedAt = new Date(Date.now() - duration * 1000);
+  const transcript = buildTranscript(patientName, providerName, specialty, slotDisplay, reason);
+  const summary    = appointmentId
+    ? `Patient ${patientName} called to book a ${specialty.toLowerCase()} appointment. Reason: ${reason}. Appointment confirmed with ${providerName} for ${slotDisplay}.`
+    : matchedProvider
+      ? `Patient ${patientName} called about ${reason.toLowerCase()}. A ${specialty} provider exists but no slots were available.`
+      : `Patient ${patientName} called about ${reason.toLowerCase()}. No ${specialty} provider is available at this clinic.`;
+  const duration = 60 + Math.floor(Math.random() * 180); // 1–4 min
 
   const call = await prisma.vogentCall.create({
     data: {
@@ -151,7 +260,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       reason,
       appointmentId:   appointmentId ?? null,
       bookedAt:        appointmentId ? new Date() : null,
-      startedAt,
+      bookingOutcome,
+      scheduledTime:   bookedSlotTime ?? null,
+      startedAt:       new Date(Date.now() - duration * 1000),
       endedAt:         new Date(),
     },
   });

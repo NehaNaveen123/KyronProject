@@ -113,6 +113,8 @@ model VogentCall {
   // Booking outcome (null if no appointment was made)
   appointmentId  String?
   bookedAt       DateTime?
+  bookingOutcome String?   // "confirmed" | "failed" | null
+  scheduledTime  DateTime? // actual booked slot time
 
   startedAt      DateTime     @default(now())
   endedAt        DateTime?
