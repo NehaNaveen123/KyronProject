@@ -33,22 +33,26 @@ function format(dt: Date) {
   let h = d.getHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
+  const min = d.getMinutes();
+  const minStr = min === 0 ? '00' : String(min).padStart(2, '0');
 
   return {
     date: `${day} (${mm}/${dd})`,
-    time: `${h}:00 ${ampm}`,
-    formatted: `${day} (${mm}/${dd}) at ${h}:00 ${ampm}`,
+    time: `${h}:${minStr} ${ampm}`,
+    formatted: `${day} (${mm}/${dd}) at ${h}:${minStr} ${ampm}`,
   };
 }
 
 /**
  * Validates that a datetime falls on a valid clinic-hour boundary in ET.
- * Uses ET hours (not raw server UTC hours) so the check is timezone-safe.
- * Exported so the admin API can reuse the same guard.
+ * Accepts both :00 and :30 minute slots within clinic hours (9–17 ET).
+ * Exported so the admin API and slot generator can reuse the same guard.
  */
 export function isValidSlotTime(dt: Date): boolean {
-  const etHour = toZonedTime(dt, TZ).getHours();
-  return HOURS.includes(etHour) && dt.getMinutes() === 0 && dt.getSeconds() === 0;
+  const etTime = toZonedTime(dt, TZ);
+  const etHour = etTime.getHours();
+  const etMin  = etTime.getMinutes();
+  return HOURS.includes(etHour) && (etMin === 0 || etMin === 30) && dt.getSeconds() === 0 && dt.getMilliseconds() === 0;
 }
 
 const isValid = isValidSlotTime;
